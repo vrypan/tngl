@@ -17,6 +17,9 @@ offers relay nodes that facilitate the communication but are unable to see the
 encrypted data passing through them. `tngl` could use private relays in the future, but this
 is beyond the current scope of the project.
 
+> [!NOTE]
+> See [SECURITY.md](SECURITY.md) for a full threat model and known limitations.
+
 ## Build
 
 Debug build:
