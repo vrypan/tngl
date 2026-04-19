@@ -1,13 +1,21 @@
-# tngl
 
 > [!WARNING]
-> `tbgl` is experimental. There may be bugs that could delete or expose
-> your files.
+> `tbgl` is experimental. **There may be bugs that could DELETE or EXPOSE
+> your files.**
 
-`tngl` syncs a folder between a small, trusted group of nodes over `iroh`.
+# tngl
+
+`tngl` (pronounced *"tangle"*) syncs a folder between a small, **trusted** group of nodes. 
 
 It is designed for direct peer-to-peer sync between your own machines or other
-trusted peers. Each node keeps a full local copy of the synced folder.
+trusted peers. Each node keeps a full local copy of the synced folder. Any node
+in the group can create a ticket that can be used by a new node to join.
+
+`tngl` uses [iroh and iroh-gossip](https://www.iroh.computer) which allows end-t-end encrypted
+connections over QUIC, and will work even if the nodes are behind a firewall: Iroh
+offers relay nodes that facilitate the communication but are unable to see the
+encrypted data passing through them. `tngl` could use private relays in the future, but this
+is beyond the current scope of the project.
 
 ## Build
 
@@ -33,18 +41,6 @@ Start a node for a folder:
 ./target/release/tngl --folder /path/to/folder
 ```
 
-On startup, `tngl` prints:
-
-- the local node ID
-- a JSON `--peer` value you can use on another node
-
-Example:
-
-```bash
-tngl node-id <NODE_ID>
-tngl peer {"id":"<NODE_ID>","addrs":[...]}
-```
-
 State is stored inside the synced folder under:
 
 ```text
@@ -58,13 +54,7 @@ This contains:
 - `pending_invites.json`: invite tokens
 - `daemon.cache`: startup cache
 
-## Two-Node Setup
-
-Start the daemon on node A:
-
-```bash
-./target/release/tngl --folder /tmp/node-a
-```
+## Additional Node Setup
 
 Generate an invite on node A:
 
@@ -112,6 +102,13 @@ Remove a peer from the membership ledger and broadcast the update:
 ```bash
 ./target/release/tngl --folder /tmp/node-a --remove-peer <NODE_ID>
 ```
+
+> [!WARNING]
+> A removed node can still listen to gossip messages exchanged by the rest
+> of the nodes, but it can not read new file contents. This means a removed
+> node may not be able to read new files, but will we aware of filenames
+> and folder activity. `tngl` is designed to be used between **trusted**
+> nodes.
 
 Set how often `SyncState` is broadcast (default 10 seconds). Lower values
 speed up repair at the cost of more gossip traffic:
