@@ -112,7 +112,7 @@ async fn run_async(config: Config) -> io::Result<()> {
     peers.retain(|peer| peer.id != endpoint.id());
     dedupe_peers(&mut peers);
 
-    let mut allowlist: HashSet<PublicKey> = peers.iter().map(|peer| peer.id).collect();
+    let allowlist: HashSet<PublicKey> = peers.iter().map(|peer| peer.id).collect();
 
     let terminated = Arc::new(AtomicBool::new(false));
     flag::register(SIGTERM, Arc::clone(&terminated)).map_err(io::Error::other)?;
