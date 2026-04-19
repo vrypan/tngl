@@ -13,7 +13,7 @@ mod transport;
 use clap::Parser;
 use config::Config;
 use daemon::{run, run_invite, run_join, run_remove};
-use iroh::{EndpointAddr, PublicKey};
+use iroh::PublicKey;
 use std::io;
 use std::path::PathBuf;
 
@@ -26,23 +26,6 @@ struct Cli {
         help = "Folder to sync (state stored in <PATH>/.tngl/)"
     )]
     folder: PathBuf,
-
-    #[arg(
-        long = "peer-id",
-        value_name = "NODE_ID",
-        action = clap::ArgAction::Append,
-        help = "Peer node ID to sync with using iroh discovery"
-    )]
-    peer_ids: Vec<PublicKey>,
-
-    #[arg(
-        long = "peer",
-        value_name = "ENDPOINT_ADDR_JSON",
-        value_parser = parse_endpoint_addr,
-        action = clap::ArgAction::Append,
-        help = "Static peer EndpointAddr encoded as JSON (advanced)"
-    )]
-    peers: Vec<EndpointAddr>,
 
     #[arg(long = "show-id", help = "Print the node ID then exit")]
     show_id: bool,
@@ -117,8 +100,6 @@ fn run_cli() -> io::Result<()> {
         key_path: state_dir.join("iroh.key"),
         peers_path: state_dir.join("peers.json"),
         invites_path: state_dir.join("pending_invites.json"),
-        peer_ids: cli.peer_ids,
-        peers: cli.peers,
         show_id: cli.show_id,
         rescan: cli.rescan,
         sync_state_interval_secs: cli.sync_state_interval_secs,
@@ -141,6 +122,3 @@ fn run_cli() -> io::Result<()> {
     run(config)
 }
 
-fn parse_endpoint_addr(input: &str) -> Result<EndpointAddr, String> {
-    serde_json::from_str(input).map_err(|err| format!("invalid peer JSON: {err}"))
-}

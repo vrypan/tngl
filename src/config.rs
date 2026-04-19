@@ -1,4 +1,3 @@
-use iroh::{EndpointAddr, PublicKey};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -8,9 +7,6 @@ pub struct Config {
     pub key_path: PathBuf,
     pub peers_path: PathBuf,
     pub invites_path: PathBuf,
-    pub peer_ids: Vec<PublicKey>,
-    pub peers: Vec<EndpointAddr>,
-
     pub show_id: bool,
     pub rescan: bool,
     pub sync_state_interval_secs: u64,

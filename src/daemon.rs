@@ -103,27 +103,16 @@ async fn run_async(config: Config) -> io::Result<()> {
     let saved_peers_file = load_peers(&config.peers_path)?;
     let topic_id = ensure_topic_id(&config.peers_path, saved_peers_file.topic_id.as_deref())?;
 
-    let mut peers: Vec<EndpointAddr> = Vec::new();
-    for peer in &config.peers {
-        peers.push(peer.clone());
-    }
-    for peer_id in &config.peer_ids {
-        peers.push(EndpointAddr::new(*peer_id));
-    }
-    for peer_id in saved_peers_file.peer_ids() {
-        peers.push(EndpointAddr::new(peer_id));
-    }
+    let mut peers: Vec<EndpointAddr> = saved_peers_file
+        .peer_ids()
+        .into_iter()
+        .map(EndpointAddr::new)
+        .collect();
     let local_origin = endpoint.id().to_string();
     peers.retain(|peer| peer.id != endpoint.id());
     dedupe_peers(&mut peers);
 
-    let mut allowlist: HashSet<PublicKey> = HashSet::new();
-    for peer_id in &config.peer_ids {
-        allowlist.insert(*peer_id);
-    }
-    for peer in &peers {
-        allowlist.insert(peer.id);
-    }
+    let mut allowlist: HashSet<PublicKey> = peers.iter().map(|peer| peer.id).collect();
 
     let terminated = Arc::new(AtomicBool::new(false));
     flag::register(SIGTERM, Arc::clone(&terminated)).map_err(io::Error::other)?;

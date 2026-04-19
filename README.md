@@ -56,30 +56,6 @@ This contains:
 
 ## Two-Node Setup
 
-### Option 1: Static Peer
-
-Start node A:
-
-```bash
-./target/release/tngl --folder /tmp/node-a
-```
-
-Copy the printed `peer` JSON from node A and start node B with it:
-
-```bash
-./target/release/tngl \
-  --folder /tmp/node-b \
-  --peer '{"id":"<NODE_ID>","addrs":[...]}'
-```
-
-You can also connect by node ID only:
-
-```bash
-./target/release/tngl --folder /tmp/node-b --peer-id <NODE_ID>
-```
-
-### Option 2: Invite / Join
-
 Start the daemon on node A:
 
 ```bash
