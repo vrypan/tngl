@@ -12,23 +12,34 @@ use crate::snapshot::{
 use crate::sync_tree::{TreeNodeInfo, get_nodes, root_hash};
 use crate::transport::{FolderProtocol, fetch_entries, send_join_request, sync_peer};
 use futures_lite::StreamExt;
+use hickory_proto::xfer::Protocol as HickoryProtocol;
+use hickory_resolver::TokioResolver;
+use hickory_resolver::config::{LookupIpStrategy, NameServerConfig, ResolverConfig, ResolverOpts};
+use hickory_resolver::name_server::TokioConnectionProvider;
+use iroh::dns::DnsResolver;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, PublicKey, SecretKey, Watcher};
 use iroh_gossip::{
     ALPN as GOSSIP_ALPN, Gossip, TopicId,
     api::{Event as GossipEvent, GossipSender},
 };
+use iroh_relay::dns::{BoxIter, DnsError, DnsProtocol, Resolver as IrohDnsResolver, TxtRecordData};
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher as _};
 use signal_hook::consts::signal::SIGTERM;
 use signal_hook::flag;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::future::Future;
 use std::io::{self, Read};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{RwLock, mpsc, oneshot};
+use url::Url;
 
 pub(crate) const ALPN: &[u8] = b"tngl/folder/1";
 const DAEMON_CACHE_VERSION: u32 = 8;
@@ -84,12 +95,13 @@ pub fn run(config: Config) -> io::Result<()> {
 
 async fn run_async(config: Config) -> io::Result<()> {
     let secret_key = load_or_create_secret_key(&config.key_path)?;
-    let endpoint = Endpoint::builder()
+    let mut endpoint_builder = Endpoint::builder()
         .alpns(vec![ALPN.to_vec(), GOSSIP_ALPN.to_vec()])
-        .secret_key(secret_key.clone())
-        .bind()
-        .await
-        .map_err(io::Error::other)?;
+        .secret_key(secret_key.clone());
+    if let Some(dns_server) = config.dns_server.as_deref() {
+        endpoint_builder = endpoint_builder.dns_resolver(build_dns_resolver(dns_server).await?);
+    }
+    let endpoint = endpoint_builder.bind().await.map_err(io::Error::other)?;
 
     if config.show_id {
         println!("{}", endpoint.id());
@@ -386,6 +398,241 @@ async fn run_async(config: Config) -> io::Result<()> {
     Ok(())
 }
 
+async fn build_dns_resolver(value: &str) -> io::Result<DnsResolver> {
+    let spec = parse_dns_server_spec(value)?;
+    let nameservers = build_nameserver_configs(&spec).await?;
+    Ok(DnsResolver::custom(ConfiguredDnsResolver::new(nameservers)))
+}
+
+fn parse_dns_socket_addr(value: &str, default_port: u16) -> io::Result<SocketAddr> {
+    if let Ok(addr) = SocketAddr::from_str(value) {
+        return Ok(addr);
+    }
+
+    if let Ok(ip) = IpAddr::from_str(value) {
+        return Ok(SocketAddr::new(ip, default_port));
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("invalid DNS server address: {value} (expected IP[:PORT] or SCHEME://IP[:PORT])"),
+    ))
+}
+
+fn default_dns_port(protocol: DnsProtocol) -> u16 {
+    match protocol {
+        DnsProtocol::Udp | DnsProtocol::Tcp => 53,
+        DnsProtocol::Tls => 853,
+        DnsProtocol::Https => 443,
+        _ => 53,
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct DnsServerSpec {
+    protocol: DnsProtocol,
+    host: String,
+    port: u16,
+    http_endpoint: Option<String>,
+}
+
+fn parse_dns_server_spec(value: &str) -> io::Result<DnsServerSpec> {
+    if !value.contains("://") {
+        let addr = parse_dns_socket_addr(value, default_dns_port(DnsProtocol::Udp))?;
+        return Ok(DnsServerSpec {
+            protocol: DnsProtocol::Udp,
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            http_endpoint: None,
+        });
+    }
+
+    let url = Url::parse(value).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid DNS server URL: {err}"),
+        )
+    })?;
+    let protocol = match url.scheme() {
+        "udp" => DnsProtocol::Udp,
+        "tcp" => DnsProtocol::Tcp,
+        "tls" => DnsProtocol::Tls,
+        "https" => DnsProtocol::Https,
+        scheme => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported DNS scheme: {scheme}"),
+            ));
+        }
+    };
+    let host = url
+        .host_str()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "DNS server URL is missing a host",
+            )
+        })?
+        .to_string();
+    let port = url.port().unwrap_or_else(|| default_dns_port(protocol));
+    let http_endpoint = match protocol {
+        DnsProtocol::Https => {
+            let mut endpoint = url.path().to_string();
+            if endpoint.is_empty() {
+                endpoint = "/dns-query".to_string();
+            }
+            if let Some(query) = url.query() {
+                endpoint.push('?');
+                endpoint.push_str(query);
+            }
+            Some(endpoint)
+        }
+        _ => None,
+    };
+
+    Ok(DnsServerSpec {
+        protocol,
+        host,
+        port,
+        http_endpoint,
+    })
+}
+
+async fn build_nameserver_configs(spec: &DnsServerSpec) -> io::Result<Vec<NameServerConfig>> {
+    let socket_addrs = resolve_dns_server_host(&spec.host, spec.port).await?;
+    let host_is_ip = IpAddr::from_str(&spec.host).is_ok();
+    let tls_dns_name = (!host_is_ip).then(|| spec.host.clone());
+    let mut nameservers = Vec::with_capacity(socket_addrs.len());
+    for socket_addr in socket_addrs {
+        let mut config = NameServerConfig::new(socket_addr, to_hickory_protocol(spec.protocol)?);
+        config.tls_dns_name = tls_dns_name.clone();
+        config.http_endpoint = spec.http_endpoint.clone();
+        nameservers.push(config);
+    }
+    Ok(nameservers)
+}
+
+async fn resolve_dns_server_host(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    if let Ok(ip) = IpAddr::from_str(host) {
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+
+    let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|err| {
+            io::Error::other(format!("failed to resolve DNS server host {host}: {err}"))
+        })?
+        .collect();
+    addrs.sort_unstable();
+    addrs.dedup();
+    if addrs.is_empty() {
+        return Err(io::Error::other(format!(
+            "DNS server host {host} resolved to no addresses"
+        )));
+    }
+    Ok(addrs)
+}
+
+fn to_hickory_protocol(protocol: DnsProtocol) -> io::Result<HickoryProtocol> {
+    match protocol {
+        DnsProtocol::Udp => Ok(HickoryProtocol::Udp),
+        DnsProtocol::Tcp => Ok(HickoryProtocol::Tcp),
+        DnsProtocol::Tls => Ok(HickoryProtocol::Tls),
+        DnsProtocol::Https => Ok(HickoryProtocol::Https),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsupported DNS protocol",
+        )),
+    }
+}
+
+#[derive(Debug)]
+struct ConfiguredDnsResolver {
+    resolver: TokioResolver,
+    nameservers: Vec<NameServerConfig>,
+}
+
+impl ConfiguredDnsResolver {
+    fn new(nameservers: Vec<NameServerConfig>) -> Self {
+        let resolver = build_hickory_resolver(&nameservers);
+        Self {
+            resolver,
+            nameservers,
+        }
+    }
+}
+
+impl IrohDnsResolver for ConfiguredDnsResolver {
+    fn lookup_ipv4(
+        &self,
+        host: String,
+    ) -> Pin<Box<dyn Future<Output = Result<BoxIter<std::net::Ipv4Addr>, DnsError>> + Send>> {
+        let resolver = self.resolver.clone();
+        Box::pin(async move {
+            let iter = resolver
+                .ipv4_lookup(host)
+                .await
+                .map_err(DnsError::from)?
+                .into_iter()
+                .map(std::net::Ipv4Addr::from);
+            Ok(Box::new(iter) as BoxIter<std::net::Ipv4Addr>)
+        })
+    }
+
+    fn lookup_ipv6(
+        &self,
+        host: String,
+    ) -> Pin<Box<dyn Future<Output = Result<BoxIter<std::net::Ipv6Addr>, DnsError>> + Send>> {
+        let resolver = self.resolver.clone();
+        Box::pin(async move {
+            let iter = resolver
+                .ipv6_lookup(host)
+                .await
+                .map_err(DnsError::from)?
+                .into_iter()
+                .map(std::net::Ipv6Addr::from);
+            Ok(Box::new(iter) as BoxIter<std::net::Ipv6Addr>)
+        })
+    }
+
+    fn lookup_txt(
+        &self,
+        host: String,
+    ) -> Pin<Box<dyn Future<Output = Result<BoxIter<TxtRecordData>, DnsError>> + Send>> {
+        let resolver = self.resolver.clone();
+        Box::pin(async move {
+            let iter = resolver
+                .txt_lookup(host)
+                .await
+                .map_err(DnsError::from)?
+                .into_iter()
+                .map(|txt| TxtRecordData::from_iter(txt.iter().cloned()));
+            Ok(Box::new(iter) as BoxIter<TxtRecordData>)
+        })
+    }
+
+    fn clear_cache(&self) {
+        self.resolver.clear_cache();
+    }
+
+    fn reset(&mut self) {
+        self.resolver = build_hickory_resolver(&self.nameservers);
+    }
+}
+
+fn build_hickory_resolver(nameservers: &[NameServerConfig]) -> TokioResolver {
+    let mut config = ResolverConfig::new();
+    for nameserver in nameservers {
+        config.add_name_server(nameserver.clone());
+    }
+    let mut options = ResolverOpts::default();
+    options.ip_strategy = LookupIpStrategy::Ipv4thenIpv6;
+    let mut builder =
+        TokioResolver::builder_with_config(config, TokioConnectionProvider::default());
+    *builder.options_mut() = options;
+    builder.build()
+}
+
 fn build_member_list_msg(
     local_origin: &str,
     members: &HashMap<String, MemberEntry>,
@@ -525,7 +772,12 @@ fn acquire_daemon_lock(state_dir: &Path) -> io::Result<fs::File> {
         .truncate(false)
         .write(true)
         .open(&lock_path)?;
-    let ret = unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX | libc::LOCK_NB) };
+    let ret = unsafe {
+        libc::flock(
+            std::os::unix::io::AsRawFd::as_raw_fd(&file),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+    };
     if ret != 0 {
         let err = io::Error::last_os_error();
         if err.kind() == io::ErrorKind::WouldBlock {

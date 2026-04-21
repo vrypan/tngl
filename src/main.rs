@@ -37,6 +37,13 @@ struct Cli {
     rescan: bool,
 
     #[arg(
+        long = "dns-server",
+        value_name = "ADDR",
+        help = "Override DNS resolver (examples: 1.1.1.1, udp://1.1.1.1:53, tls://1.1.1.1:853, https://dns.google/dns-query)"
+    )]
+    dns_server: Option<String>,
+
+    #[arg(
         long = "sync-state-interval",
         value_name = "SECONDS",
         default_value = "10",
@@ -102,6 +109,7 @@ fn run_cli() -> io::Result<()> {
         invites_path: state_dir.join("pending_invites.json"),
         show_id: cli.show_id,
         rescan: cli.rescan,
+        dns_server: cli.dns_server,
         sync_state_interval_secs: cli.sync_state_interval_secs,
         invite_expire_secs: cli.expire,
     };
@@ -121,4 +129,3 @@ fn run_cli() -> io::Result<()> {
 
     run(config)
 }
-

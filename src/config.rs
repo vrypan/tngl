@@ -9,6 +9,7 @@ pub struct Config {
     pub invites_path: PathBuf,
     pub show_id: bool,
     pub rescan: bool,
+    pub dns_server: Option<String>,
     pub sync_state_interval_secs: u64,
     pub invite_expire_secs: u64,
 }

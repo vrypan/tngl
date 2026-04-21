@@ -15,8 +15,11 @@ path = "src/main.rs"
 blake3 = "1.8.2"
 clap = { version = "4.5.40", default-features = false, features = ["derive", "std", "color", "help", "usage", "error-context"] }
 futures-lite = "2.6.1"
+hickory-resolver = { version = "0.25.2", default-features = false, features = ["tokio", "system-config", "tls-ring", "https-ring"] }
+hickory-proto = { version = "0.25.2", default-features = false, features = ["std", "https-ring", "tls-ring"] }
 iroh = "0.96.1"
 iroh-gossip = "0.96.0"
+iroh-relay = "0.96.1"
 libc = "0.2.185"
 notify = "8.2.0"
 rkyv = "0.8.15"
@@ -26,6 +29,7 @@ signal-hook = "0.4.4"
 tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros", "io-util", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.5.4"
 
 [dev-dependencies]
 tempfile = "3.20.0"

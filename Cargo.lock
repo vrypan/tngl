@@ -3606,8 +3606,11 @@ dependencies = [
  "blake3",
  "clap",
  "futures-lite",
+ "hickory-proto",
+ "hickory-resolver",
  "iroh",
  "iroh-gossip",
+ "iroh-relay",
  "libc",
  "notify",
  "rkyv",
@@ -3618,6 +3621,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
