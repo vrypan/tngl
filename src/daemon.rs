@@ -337,6 +337,9 @@ async fn run_async(config: Config) -> io::Result<()> {
                 }
                 state.allowlist.write().await.insert(id);
                 persist_members(&state.peers_path, state.topic_id, &state.members)?;
+                if let Err(err) = state.gossip_sender.join_peers(vec![id]).await {
+                    tracing::warn!(target: "tngl::gossip", %id, "join_peers failed: {err}");
+                }
                 let _ = cmd_tx.send(Command::SyncPeer(peer_addr));
                 publish_gossip(
                     &state,
@@ -525,7 +528,12 @@ fn acquire_daemon_lock(state_dir: &Path) -> io::Result<fs::File> {
         .truncate(false)
         .write(true)
         .open(&lock_path)?;
-    let ret = unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX | libc::LOCK_NB) };
+    let ret = unsafe {
+        libc::flock(
+            std::os::unix::io::AsRawFd::as_raw_fd(&file),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+    };
     if ret != 0 {
         let err = io::Error::last_os_error();
         if err.kind() == io::ErrorKind::WouldBlock {
@@ -750,6 +758,12 @@ async fn handle_gossip_message(
             let allowlist: HashSet<PublicKey> = peers.iter().map(|peer| peer.id).collect();
             *state.allowlist.write().await = allowlist;
             persist_members(&state.peers_path, state.topic_id, &state.members)?;
+            if !peers.is_empty() {
+                let peer_ids: Vec<PublicKey> = peers.iter().map(|peer| peer.id).collect();
+                if let Err(err) = state.gossip_sender.join_peers(peer_ids).await {
+                    tracing::warn!(target: "tngl::gossip", "join_peers failed: {err}");
+                }
+            }
             for peer in peers {
                 let _ = cmd_tx.send(Command::SyncPeer(peer));
             }
