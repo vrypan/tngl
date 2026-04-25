@@ -4,7 +4,8 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum EntryKind {
     File,
     Dir,
@@ -130,6 +131,10 @@ impl FolderState {
 
     pub fn live_tree(&self) -> &TreeSnapshot {
         &self.live_tree
+    }
+
+    pub fn lamport(&self) -> u64 {
+        self.lamport
     }
 
     pub fn rescan(&mut self) -> io::Result<Vec<Change>> {
