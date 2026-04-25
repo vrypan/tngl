@@ -1,4 +1,6 @@
 mod message;
+mod protocol;
+mod rpc;
 mod state;
 mod watcher;
 
@@ -13,8 +15,9 @@ use iroh_gossip::{ALPN as GOSSIP_ALPN, Gossip, TopicId};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc};
 
 const KEY_FILE: &str = "private.key";
 
@@ -79,14 +82,17 @@ async fn run() -> io::Result<()> {
 
     let secret_key = load_or_create_secret_key(&state_dir.join(KEY_FILE))?;
     let endpoint = Endpoint::builder()
-        .alpns(vec![GOSSIP_ALPN.to_vec()])
+        .alpns(vec![GOSSIP_ALPN.to_vec(), rpc::ALPN.to_vec()])
         .secret_key(secret_key)
         .bind()
         .await
         .map_err(io::Error::other)?;
 
     let local_origin = endpoint.id().to_string();
-    let mut state = FolderState::new(cli.folder.clone(), local_origin.clone())?;
+    let state = Arc::new(RwLock::new(FolderState::new(
+        cli.folder.clone(),
+        local_origin.clone(),
+    )?));
     let ticket = match cli.ticket.as_deref() {
         Some(ticket) => parse_ticket(ticket)?,
         None => Ticket {
@@ -95,14 +101,19 @@ async fn run() -> io::Result<()> {
         },
     };
 
-    print_start(&state, &endpoint, &ticket, cli.poll, cli.interval_ms);
+    {
+        let state = state.read().await;
+        print_start(&state, &endpoint, &ticket, cli.poll, cli.interval_ms);
+    }
 
     let (fs_tx, mut fs_rx) = mpsc::unbounded_channel();
-    let _watcher = watcher::spawn(state.root().to_path_buf(), cli.interval_ms, cli.poll, fs_tx)?;
+    let watch_root = state.read().await.root().to_path_buf();
+    let _watcher = watcher::spawn(watch_root, cli.interval_ms, cli.poll, fs_tx)?;
 
     let gossip = Gossip::builder().spawn(endpoint.clone());
     let _router = Router::builder(endpoint.clone())
         .accept(GOSSIP_ALPN, gossip.clone())
+        .accept(rpc::ALPN, rpc::FolderRpc::new(Arc::clone(&state)))
         .spawn();
 
     let topic = gossip
@@ -111,7 +122,10 @@ async fn run() -> io::Result<()> {
         .map_err(io::Error::other)?;
     let (sender, mut receiver) = topic.split();
 
-    publish_sync_state(&sender, &state, &local_origin).await;
+    {
+        let state = state.read().await;
+        publish_sync_state(&sender, &StateSnapshot::from_state(&state), &local_origin).await;
+    }
 
     let mut announce_interval =
         tokio::time::interval(Duration::from_secs(cli.announce_interval_secs.max(1)));
@@ -120,53 +134,87 @@ async fn run() -> io::Result<()> {
     loop {
         tokio::select! {
             Some(()) = fs_rx.recv() => {
-                let before_state = state.root_hash();
-                let before_live = state.live_root_hash();
-                match state.rescan() {
-                    Ok(changes) if changes.is_empty() => {}
-                    Ok(changes) => {
-                        print_changes(before_state, before_live, &state, &changes);
-                        publish_filesystem_changed(&sender, &state, &local_origin, &changes).await;
+                let update = {
+                    let mut state = state.write().await;
+                    let before_state = state.root_hash();
+                    let before_live = state.live_root_hash();
+                    match state.rescan() {
+                        Ok(changes) if changes.is_empty() => None,
+                        Ok(changes) => {
+                            print_changes(before_state, before_live, &state, &changes);
+                            Some((changes, StateSnapshot::from_state(&state)))
+                        }
+                        Err(err) => {
+                            tracing::warn!("scan failed: {err}");
+                            None
+                        }
                     }
-                    Err(err) => tracing::warn!("scan failed: {err}"),
+                };
+                if let Some((changes, snapshot)) = update {
+                    publish_filesystem_changed(&sender, &snapshot, &local_origin, &changes).await;
                 }
             }
             event = receiver.next() => {
                 let Some(event) = event else {
                     return Err(io::Error::new(io::ErrorKind::BrokenPipe, "gossip stream closed"));
                 };
-                handle_gossip_event(event, &state, &local_origin)?;
+                handle_gossip_event(event, &endpoint, Arc::clone(&state), &local_origin).await?;
             }
             _ = announce_interval.tick() => {
-                publish_sync_state(&sender, &state, &local_origin).await;
+                let snapshot = {
+                    let state = state.read().await;
+                    StateSnapshot::from_state(&state)
+                };
+                publish_sync_state(&sender, &snapshot, &local_origin).await;
             }
         }
     }
 }
 
-async fn publish_sync_state(sender: &GossipSender, state: &FolderState, origin: &str) {
+#[derive(Clone, Copy)]
+struct StateSnapshot {
+    state_root: [u8; 32],
+    live_root: [u8; 32],
+    lamport: u64,
+    state_nodes: usize,
+    live_nodes: usize,
+}
+
+impl StateSnapshot {
+    fn from_state(state: &FolderState) -> Self {
+        Self {
+            state_root: state.root_hash(),
+            live_root: state.live_root_hash(),
+            lamport: state.lamport(),
+            state_nodes: state.tree().nodes.len(),
+            live_nodes: state.live_tree().nodes.len(),
+        }
+    }
+}
+
+async fn publish_sync_state(sender: &GossipSender, state: &StateSnapshot, origin: &str) {
     let message = GossipMessage::SyncState {
         origin: origin.to_string(),
-        state_root: state.root_hash(),
-        live_root: state.live_root_hash(),
-        lamport: state.lamport(),
-        state_nodes: state.tree().nodes.len(),
-        live_nodes: state.live_tree().nodes.len(),
+        state_root: state.state_root,
+        live_root: state.live_root,
+        lamport: state.lamport,
+        state_nodes: state.state_nodes,
+        live_nodes: state.live_nodes,
     };
     publish(sender, message).await;
 }
 
 async fn publish_filesystem_changed(
     sender: &GossipSender,
-    state: &FolderState,
+    state: &StateSnapshot,
     origin: &str,
     changes: &[Change],
 ) {
     let message = GossipMessage::FilesystemChanged {
         origin: origin.to_string(),
-        state_root: state.root_hash(),
-        live_root: state.live_root_hash(),
-        lamport: state.lamport(),
+        state_root: state.state_root,
+        live_root: state.live_root,
+        lamport: state.lamport,
         changes: changes.iter().map(WireChange::from).collect(),
     };
     publish(sender, message).await;
@@ -179,9 +227,10 @@ async fn publish(sender: &GossipSender, message: GossipMessage) {
     }
 }
 
-fn handle_gossip_event(
+async fn handle_gossip_event(
     event: Result<GossipEvent, ApiError>,
-    state: &FolderState,
+    endpoint: &Endpoint,
+    state: Arc<RwLock<FolderState>>,
     local_origin: &str,
 ) -> io::Result<()> {
     match event {
@@ -193,7 +242,12 @@ fn handle_gossip_event(
             if message.origin() == local_origin {
                 return Ok(());
             }
-            print_remote_message(&message, state);
+            let local = {
+                let state = state.read().await;
+                StateSnapshot::from_state(&state)
+            };
+            print_remote_message(&message, &local);
+            maybe_probe_remote_rpc(endpoint.clone(), message, state);
         }
         Ok(GossipEvent::NeighborUp(endpoint_id)) => {
             tracing::info!("gossip neighbor up {endpoint_id}");
@@ -209,7 +263,7 @@ fn handle_gossip_event(
     Ok(())
 }
 
-fn print_remote_message(message: &GossipMessage, state: &FolderState) {
+fn print_remote_message(message: &GossipMessage, state: &StateSnapshot) {
     match message {
         GossipMessage::SyncState {
             origin,
@@ -227,8 +281,8 @@ fn print_remote_message(message: &GossipMessage, state: &FolderState) {
                 hex(*live_root),
                 state_nodes,
                 live_nodes,
-                *state_root == state.root_hash(),
-                *live_root == state.live_root_hash()
+                *state_root == state.state_root,
+                *live_root == state.live_root
             );
         }
         GossipMessage::FilesystemChanged {
@@ -245,8 +299,8 @@ fn print_remote_message(message: &GossipMessage, state: &FolderState) {
                 changes.len(),
                 hex(*state_root),
                 hex(*live_root),
-                *state_root == state.root_hash(),
-                *live_root == state.live_root_hash()
+                *state_root == state.state_root,
+                *live_root == state.live_root
             );
             for change in changes {
                 tracing::info!(
@@ -259,6 +313,70 @@ fn print_remote_message(message: &GossipMessage, state: &FolderState) {
             }
         }
     }
+}
+
+fn maybe_probe_remote_rpc(
+    endpoint: Endpoint,
+    message: GossipMessage,
+    state: Arc<RwLock<FolderState>>,
+) {
+    let (origin, remote_state_root, remote_live_root) = match message {
+        GossipMessage::SyncState {
+            origin,
+            state_root,
+            live_root,
+            ..
+        }
+        | GossipMessage::FilesystemChanged {
+            origin,
+            state_root,
+            live_root,
+            ..
+        } => (origin, state_root, live_root),
+    };
+    let Ok(peer) = origin.parse::<PublicKey>() else {
+        tracing::warn!("cannot RPC probe peer with invalid origin {origin}");
+        return;
+    };
+
+    tokio::spawn(async move {
+        let local = {
+            let state = state.read().await;
+            StateSnapshot::from_state(&state)
+        };
+        if remote_state_root == local.state_root && remote_live_root == local.live_root {
+            return;
+        }
+
+        match rpc::get_root(&endpoint, peer).await {
+            Ok((state_root, live_root, lamport)) => {
+                tracing::info!(
+                    "rpc GetRoot peer={} lamport={} state_root={} live_root={}",
+                    peer,
+                    lamport,
+                    hex(state_root),
+                    hex(live_root)
+                );
+            }
+            Err(err) => {
+                tracing::warn!("rpc GetRoot peer={} failed: {err}", peer);
+                return;
+            }
+        }
+
+        match rpc::get_node(&endpoint, peer, "").await {
+            Ok(Some(node)) => tracing::info!(
+                "rpc GetNode peer={} prefix={} entries={} children={} hash={}",
+                peer,
+                node.prefix,
+                node.entries.len(),
+                node.children.len(),
+                hex(node.hash)
+            ),
+            Ok(None) => tracing::warn!("rpc GetNode peer={} root missing", peer),
+            Err(err) => tracing::warn!("rpc GetNode peer={} failed: {err}", peer),
+        }
+    });
 }
 
 fn print_start(

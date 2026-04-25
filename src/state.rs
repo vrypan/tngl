@@ -34,7 +34,7 @@ impl EntryKind {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Version {
     pub lamport: u64,
     pub origin: String,
@@ -54,7 +54,7 @@ impl PartialOrd for Version {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Entry {
     pub path: String,
     pub kind: EntryKind,
@@ -86,7 +86,7 @@ impl Change {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TreeNode {
     pub prefix: String,
     pub entries: BTreeMap<String, [u8; 32]>,
@@ -147,6 +147,24 @@ impl FolderState {
 
     pub fn lamport(&self) -> u64 {
         self.lamport
+    }
+
+    pub fn node(&self, prefix: &str) -> Option<TreeNode> {
+        self.tree.nodes.get(&normalize_prefix(prefix)).cloned()
+    }
+
+    pub fn entry(&self, path: &str) -> Option<Entry> {
+        self.entries.get(path.trim_matches('/')).cloned()
+    }
+
+    pub fn object_path(&self, content_hash: [u8; 32]) -> Option<PathBuf> {
+        self.entries.values().find_map(|entry| {
+            if entry.kind == EntryKind::File && entry.content_hash == Some(content_hash) {
+                Some(self.root.join(&entry.path))
+            } else {
+                None
+            }
+        })
     }
 
     pub fn rescan(&mut self) -> io::Result<Vec<Change>> {
@@ -601,6 +619,10 @@ fn ancestors(path: &str) -> Vec<String> {
         current = parent_path(&current);
     }
     out
+}
+
+fn normalize_prefix(prefix: &str) -> String {
+    prefix.trim_matches('/').to_string()
 }
 
 fn parent_path(path: &str) -> String {
