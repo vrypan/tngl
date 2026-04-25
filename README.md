@@ -53,6 +53,7 @@ State is stored inside the synced folder under:
 This contains:
 
 - `private.key`: node identity key
+- `daemon.lock`: exclusive process lock
 - `peers.json`: known peers
 - `pending_invites.json`: invite tokens
 - `daemon.cache`: startup cache

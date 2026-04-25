@@ -75,6 +75,7 @@ async fn run() -> io::Result<()> {
 
     let state_dir = cli.folder.join(".tngl");
     fs::create_dir_all(&state_dir)?;
+    let _lock = acquire_daemon_lock(&state_dir)?;
 
     let secret_key = load_or_create_secret_key(&state_dir.join(KEY_FILE))?;
     let endpoint = Endpoint::builder()
@@ -354,6 +355,45 @@ fn load_or_create_secret_key(path: &Path) -> io::Result<SecretKey> {
     Ok(SecretKey::from_bytes(&bytes))
 }
 
+#[cfg(unix)]
+fn acquire_daemon_lock(state_dir: &Path) -> io::Result<fs::File> {
+    use std::os::fd::AsRawFd;
+
+    let lock_path = state_dir.join("daemon.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)?;
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result != 0 {
+        let err = io::Error::last_os_error();
+        if err.kind() == io::ErrorKind::WouldBlock {
+            return Err(io::Error::other(
+                "another tngl instance is already running on this folder",
+            ));
+        }
+        return Err(err);
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn acquire_daemon_lock(state_dir: &Path) -> io::Result<fs::File> {
+    let lock_path = state_dir.join("daemon.lock");
+    fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|err| {
+            if err.kind() == io::ErrorKind::AlreadyExists {
+                io::Error::other("another tngl instance is already running on this folder")
+            } else {
+                err
+            }
+        })
+}
+
 fn new_topic_id() -> io::Result<TopicId> {
     let mut bytes = [0_u8; 32];
     fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
@@ -404,5 +444,20 @@ mod tests {
 
         assert_eq!(first.public(), second.public());
         assert_eq!(fs::read(key_path).unwrap().len(), 32);
+    }
+
+    #[test]
+    fn daemon_lock_rejects_second_holder() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let first = acquire_daemon_lock(tmp.path()).unwrap();
+        let second = acquire_daemon_lock(tmp.path()).unwrap_err();
+
+        assert_eq!(
+            second.to_string(),
+            "another tngl instance is already running on this folder"
+        );
+        drop(first);
+        let _third = acquire_daemon_lock(tmp.path()).unwrap();
     }
 }

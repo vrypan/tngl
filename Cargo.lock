@@ -3487,6 +3487,7 @@ dependencies = [
  "futures-lite",
  "iroh",
  "iroh-gossip",
+ "libc",
  "notify",
  "serde",
  "serde_json",
