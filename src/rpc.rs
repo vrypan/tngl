@@ -1,8 +1,6 @@
 use crate::group::{self, GroupState, MemberEntry};
-use crate::protocol::{
-    RequestMessage, ResponseMessage, assert_eof, close_send, read_frame, read_object_bytes,
-    write_frame,
-};
+use crate::protocol::{RequestMessage, ResponseMessage, assert_eof, close_send, read_frame, write_frame};
+use tokio::io::AsyncWriteExt;
 use crate::state::{Entry, FolderState, TreeNode, hex};
 use iroh::endpoint::{Connection, ConnectionError};
 use iroh::protocol::{AcceptError, ProtocolHandler};
@@ -129,20 +127,45 @@ impl RpcClient {
         }
     }
 
-    pub async fn get_object(&self, peer: PublicKey, content_hash: [u8; 32]) -> io::Result<Vec<u8>> {
+    pub async fn get_object_to_file(
+        &self,
+        peer: PublicKey,
+        content_hash: [u8; 32],
+        expected_size: u64,
+        dest: &std::path::Path,
+    ) -> io::Result<()> {
         let request_id = next_request_id();
         let request = RequestMessage::GetObject {
             request_id,
             content_hash,
         };
         let connection = self.connection(peer).await?;
-        match get_object_on_connection(&connection, peer, request_id, &request).await {
-            Ok(bytes) => Ok(bytes),
+        match get_object_to_file_on_connection(
+            &connection,
+            peer,
+            request_id,
+            &request,
+            content_hash,
+            expected_size,
+            dest,
+        )
+        .await
+        {
+            Ok(()) => Ok(()),
             Err(first_err) => {
                 self.drop_connection(peer).await;
                 tracing::debug!(target: "tngl::rpc", %peer, "retrying GetObject after: {first_err}");
                 let connection = self.connection(peer).await?;
-                get_object_on_connection(&connection, peer, request_id, &request).await
+                get_object_to_file_on_connection(
+                    &connection,
+                    peer,
+                    request_id,
+                    &request,
+                    content_hash,
+                    expected_size,
+                    dest,
+                )
+                .await
             }
         }
     }
@@ -444,12 +467,15 @@ async fn round_trip_on_connection(
     Ok(response)
 }
 
-async fn get_object_on_connection(
+async fn get_object_to_file_on_connection(
     connection: &Connection,
     peer: PublicKey,
     request_id: u64,
     request: &RequestMessage,
-) -> io::Result<Vec<u8>> {
+    expected_hash: [u8; 32],
+    expected_size: u64,
+    dest: &std::path::Path,
+) -> io::Result<()> {
     let (mut send, mut recv) = connection
         .open_bi()
         .await
@@ -482,14 +508,59 @@ async fn get_object_on_connection(
         }
     };
 
-    let bytes = read_object_bytes(&mut recv, size)
-        .await
-        .map_err(|err| io::Error::other(format!("read object bytes from {peer}: {err}")))?;
+    if size != expected_size {
+        return Err(io::Error::other(format!(
+            "object size mismatch from {peer}: expected {expected_size}, got {size}"
+        )));
+    }
+
+    let result = stream_to_file(&mut recv, size, expected_hash, dest).await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(dest).await;
+    }
+    result?;
+
     assert_eof(&mut recv)
         .await
         .map_err(|err| io::Error::other(format!("trailing bytes from {peer}: {err}")))?;
+    Ok(())
+}
 
-    Ok(bytes)
+async fn stream_to_file(
+    recv: &mut iroh::endpoint::RecvStream,
+    size: u64,
+    expected_hash: [u8; 32],
+    dest: &std::path::Path,
+) -> io::Result<()> {
+    let mut file = tokio::fs::File::create(dest).await?;
+    let mut hasher = blake3::Hasher::new();
+    let mut remaining = size;
+    let mut buf = vec![0u8; 256 * 1024];
+
+    while remaining > 0 {
+        let to_read = (remaining as usize).min(buf.len());
+        let n = recv
+            .read(&mut buf[..to_read])
+            .await
+            .map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::other("unexpected EOF during object transfer"))?;
+        hasher.update(&buf[..n]);
+        file.write_all(&buf[..n]).await?;
+        remaining -= n as u64;
+    }
+
+    file.sync_all().await?;
+
+    let actual_hash = *hasher.finalize().as_bytes();
+    if actual_hash != expected_hash {
+        return Err(io::Error::other(format!(
+            "object hash mismatch: expected {}, got {}",
+            hex(expected_hash),
+            hex(actual_hash),
+        )));
+    }
+
+    Ok(())
 }
 
 fn is_routine_connection_close(err: &ConnectionError) -> bool {

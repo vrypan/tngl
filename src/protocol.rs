@@ -95,15 +95,6 @@ pub async fn close_send(send: &mut iroh::endpoint::SendStream) -> io::Result<()>
     }
 }
 
-pub async fn read_object_bytes(
-    recv: &mut iroh::endpoint::RecvStream,
-    size: u64,
-) -> io::Result<Vec<u8>> {
-    let mut bytes = vec![0u8; size as usize];
-    recv.read_exact(&mut bytes).await.map_err(io::Error::other)?;
-    Ok(bytes)
-}
-
 pub async fn assert_eof(recv: &mut iroh::endpoint::RecvStream) -> io::Result<()> {
     let trailing = recv.read_to_end(1).await.map_err(io::Error::other)?;
     if trailing.is_empty() {

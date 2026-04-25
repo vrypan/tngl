@@ -3,8 +3,12 @@ use crate::state::{Change, EntryKind, FolderState, TreeNode, hex};
 use iroh::PublicKey;
 use std::collections::BTreeSet;
 use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
+use tokio::task::JoinSet;
+
+const MAX_CONCURRENT_FETCHES: usize = 8;
 
 pub async fn reconcile_with_peer(
     rpc: RpcClient,
@@ -102,6 +106,8 @@ async fn reconcile_entries(
     remote_node: &TreeNode,
     changes: &mut Vec<Change>,
 ) -> io::Result<()> {
+    // Phase 1: fetch metadata for all changed entries.
+    let mut to_apply: Vec<crate::state::Entry> = Vec::new();
     for (name, remote_hash) in &remote_node.entries {
         if local_node
             .and_then(|node| node.entries.get(name))
@@ -109,52 +115,67 @@ async fn reconcile_entries(
         {
             continue;
         }
-
         let path = join_path(prefix, name);
         let Some(remote_entry) = rpc.get_entry(peer, &path).await? else {
             return Err(io::Error::other(format!(
                 "peer {peer} did not return entry {path}"
             )));
         };
-
-        let should_accept = {
-            let state = state.read().await;
-            state.should_accept_remote(&remote_entry)
-        };
-        if !should_accept {
+        if !state.read().await.should_accept_remote(&remote_entry) {
             continue;
         }
+        to_apply.push(remote_entry);
+    }
 
-        let object = match remote_entry.kind {
-            EntryKind::File => {
-                let content_hash = remote_entry.content_hash.ok_or_else(|| {
-                    io::Error::other(format!(
-                        "remote file {} has no content hash",
-                        remote_entry.path
-                    ))
-                })?;
-                Some(rpc.get_object(peer, content_hash).await?)
-            }
-            EntryKind::Dir | EntryKind::Tombstone => None,
-        };
+    // Phase 2: apply non-file entries immediately; download file entries in parallel.
+    let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_FETCHES));
+    let mut join_set: JoinSet<io::Result<(crate::state::Entry, PathBuf)>> = JoinSet::new();
 
-        let applied = {
+    for entry in to_apply {
+        if entry.kind == EntryKind::File {
+            let content_hash = entry.content_hash.ok_or_else(|| {
+                io::Error::other(format!("remote file {} has no content hash", entry.path))
+            })?;
+            let tmp_path = state.read().await.tmp_recv_path(&entry);
+            let rpc = rpc.clone();
+            let sem = Arc::clone(&sem);
+            let expected_size = entry.size;
+            join_set.spawn(async move {
+                let _permit = sem.acquire().await.map_err(io::Error::other)?;
+                rpc.get_object_to_file(peer, content_hash, expected_size, &tmp_path)
+                    .await?;
+                Ok((entry, tmp_path))
+            });
+        } else {
             let mut state = state.write().await;
-            state.apply_remote_entry(remote_entry, object.as_deref())?
-        };
-        if let Some(change) = applied {
-            tracing::info!(
-                "sync applied {} {} v{}:{}",
-                change.verb(),
-                change.path,
-                change.new.version.lamport,
-                change.new.version.origin
-            );
+            if let Some(change) = state.apply_remote_entry(entry, None)? {
+                log_applied(&change);
+                changes.push(change);
+            }
+        }
+    }
+
+    // Phase 3: apply file entries as their downloads complete.
+    while let Some(result) = join_set.join_next().await {
+        let (entry, tmp_path) = result.map_err(io::Error::other)??;
+        let mut state = state.write().await;
+        if let Some(change) = state.apply_remote_entry(entry, Some(&tmp_path))? {
+            log_applied(&change);
             changes.push(change);
         }
     }
 
     Ok(())
+}
+
+fn log_applied(change: &Change) {
+    tracing::info!(
+        "sync applied {} {} v{}:{}",
+        change.verb(),
+        change.path,
+        change.new.version.lamport,
+        change.new.version.origin
+    );
 }
 
 fn queue_changed_children(

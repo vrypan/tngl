@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 const STATE_DIR: &str = ".tngl";
@@ -113,6 +113,7 @@ pub struct FolderState {
 impl FolderState {
     pub fn new(root: PathBuf, origin: String) -> io::Result<Self> {
         let root = fs::canonicalize(root)?;
+        fs::create_dir_all(root.join(STATE_DIR))?;
         let mut state = Self {
             root,
             origin,
@@ -174,25 +175,35 @@ impl FolderState {
             .unwrap_or(true)
     }
 
+    pub fn tmp_recv_path(&self, entry: &Entry) -> PathBuf {
+        self.root.join(STATE_DIR).join(format!(
+            "recv-{}-{}",
+            entry.version.lamport,
+            entry.path.replace('/', "_")
+        ))
+    }
+
     pub fn apply_remote_entry(
         &mut self,
         remote: Entry,
-        object_bytes: Option<&[u8]>,
+        object_tmp_path: Option<&Path>,
     ) -> io::Result<Option<Change>> {
         if !self.should_accept_remote(&remote) {
+            if let Some(tmp) = object_tmp_path {
+                let _ = fs::remove_file(tmp);
+            }
             return Ok(None);
         }
 
         match remote.kind {
             EntryKind::File => {
-                let bytes = object_bytes.ok_or_else(|| {
+                let tmp = object_tmp_path.ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!("missing object bytes for {}", remote.path),
+                        format!("missing tmp path for file {}", remote.path),
                     )
                 })?;
-                verify_object_bytes(&remote, bytes)?;
-                self.write_remote_file(&remote, bytes)?;
+                self.install_remote_file(&remote, tmp)?;
             }
             EntryKind::Dir => {
                 fs::create_dir_all(self.root.join(&remote.path))?;
@@ -217,31 +228,17 @@ impl FolderState {
         }))
     }
 
-    fn write_remote_file(&self, remote: &Entry, bytes: &[u8]) -> io::Result<()> {
-        let path = self.root.join(&remote.path);
-        if let Some(parent) = path.parent() {
+    fn install_remote_file(&self, remote: &Entry, tmp_path: &Path) -> io::Result<()> {
+        let dest = self.root.join(&remote.path);
+        if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
-
-        let tmp_dir = self.root.join(STATE_DIR);
-        fs::create_dir_all(&tmp_dir)?;
-        let tmp_path = tmp_dir.join(format!(
-            "recv-{}-{}",
-            remote.version.lamport,
-            remote.path.replace('/', "_")
-        ));
-
-        {
-            let mut file = fs::File::create(&tmp_path)?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-        }
-        fs::rename(&tmp_path, &path)?;
+        fs::rename(tmp_path, &dest)?;
 
         #[cfg(unix)]
         if let Some(mode) = remote.mode {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
+            fs::set_permissions(&dest, fs::Permissions::from_mode(mode))?;
         }
 
         Ok(())
@@ -449,33 +446,6 @@ impl FolderState {
             origin: self.origin.clone(),
         }
     }
-}
-
-fn verify_object_bytes(entry: &Entry, bytes: &[u8]) -> io::Result<()> {
-    if entry.size != bytes.len() as u64 {
-        return Err(io::Error::other(format!(
-            "object size mismatch for {}: expected {}, got {}",
-            entry.path,
-            entry.size,
-            bytes.len()
-        )));
-    }
-    let Some(expected_hash) = entry.content_hash else {
-        return Err(io::Error::other(format!(
-            "file entry {} has no content hash",
-            entry.path
-        )));
-    };
-    let actual_hash = *blake3::hash(bytes).as_bytes();
-    if actual_hash != expected_hash {
-        return Err(io::Error::other(format!(
-            "object hash mismatch for {}: expected {}, got {}",
-            entry.path,
-            hex(expected_hash),
-            hex(actual_hash)
-        )));
-    }
-    Ok(())
 }
 
 fn remove_path_if_exists(path: &Path) -> io::Result<()> {
@@ -1218,8 +1188,10 @@ mod tests {
             },
         };
 
+        let tmp_path = state.tmp_recv_path(&remote);
+        fs::write(&tmp_path, bytes).unwrap();
         let change = state
-            .apply_remote_entry(remote, Some(bytes.as_slice()))
+            .apply_remote_entry(remote, Some(&tmp_path))
             .unwrap()
             .unwrap();
 
