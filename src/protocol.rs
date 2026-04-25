@@ -53,9 +53,9 @@ pub enum ResponseMessage {
         request_id: u64,
         entry: Option<Entry>,
     },
-    Object {
+    ObjectHeader {
         request_id: u64,
-        bytes: Vec<u8>,
+        size: u64,
     },
     Error {
         request_id: u64,
@@ -93,6 +93,15 @@ pub async fn close_send(send: &mut iroh::endpoint::SendStream) -> io::Result<()>
             "stream stopped by peer with code {code}"
         ))),
     }
+}
+
+pub async fn read_object_bytes(
+    recv: &mut iroh::endpoint::RecvStream,
+    size: u64,
+) -> io::Result<Vec<u8>> {
+    let mut bytes = vec![0u8; size as usize];
+    recv.read_exact(&mut bytes).await.map_err(io::Error::other)?;
+    Ok(bytes)
 }
 
 pub async fn assert_eof(recv: &mut iroh::endpoint::RecvStream) -> io::Result<()> {

@@ -142,7 +142,7 @@ async fn run() -> io::Result<()> {
         );
     }
 
-    let (fs_tx, mut fs_rx) = mpsc::unbounded_channel();
+    let (fs_tx, mut fs_rx) = mpsc::unbounded_channel::<Vec<PathBuf>>();
     let (rpc_event_tx, mut rpc_event_rx) = mpsc::unbounded_channel();
     let watch_root = state.read().await.root().to_path_buf();
     let _watcher = watcher::spawn(watch_root, cli.interval_ms, cli.poll, fs_tx)?;
@@ -185,12 +185,17 @@ async fn run() -> io::Result<()> {
 
     loop {
         tokio::select! {
-            Some(()) = fs_rx.recv() => {
+            Some(paths) = fs_rx.recv() => {
                 let update = {
                     let mut state = state.write().await;
                     let before_state = state.root_hash();
                     let before_live = state.live_root_hash();
-                    match state.rescan() {
+                    let result = if paths.is_empty() {
+                        state.rescan()
+                    } else {
+                        state.apply_paths(paths)
+                    };
+                    match result {
                         Ok(changes) if changes.is_empty() => None,
                         Ok(changes) => {
                             print_changes(before_state, before_live, &state, &changes);

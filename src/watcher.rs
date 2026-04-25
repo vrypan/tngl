@@ -10,7 +10,7 @@ pub fn spawn(
     root: PathBuf,
     debounce_ms: u64,
     poll: bool,
-    tx: UnboundedSender<()>,
+    tx: UnboundedSender<Vec<PathBuf>>,
 ) -> io::Result<thread::JoinHandle<()>> {
     if poll {
         Ok(thread::spawn(move || run_polling(debounce_ms, tx)))
@@ -22,7 +22,7 @@ pub fn spawn(
 fn spawn_watcher(
     root: PathBuf,
     debounce_ms: u64,
-    tx: UnboundedSender<()>,
+    tx: UnboundedSender<Vec<PathBuf>>,
 ) -> io::Result<thread::JoinHandle<()>> {
     let (watch_tx, watch_rx) = mpsc::channel();
     let mut watcher = RecommendedWatcher::new(
@@ -44,8 +44,11 @@ fn spawn_watcher(
             match result {
                 Ok(event) => {
                     tracing::debug!("filesystem event: {:?}", event.kind);
-                    drain_debounce_window(&watch_rx, debounce);
-                    let _ = tx.send(());
+                    let mut paths = event.paths;
+                    drain_debounce_window(&watch_rx, debounce, &mut paths);
+                    paths.sort();
+                    paths.dedup();
+                    let _ = tx.send(paths);
                 }
                 Err(err) => tracing::warn!("filesystem watch error: {err}"),
             }
@@ -53,7 +56,11 @@ fn spawn_watcher(
     }))
 }
 
-fn drain_debounce_window(rx: &mpsc::Receiver<notify::Result<Event>>, debounce: Duration) {
+fn drain_debounce_window(
+    rx: &mpsc::Receiver<notify::Result<Event>>,
+    debounce: Duration,
+    paths: &mut Vec<PathBuf>,
+) {
     let deadline = Instant::now() + debounce;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -62,7 +69,10 @@ fn drain_debounce_window(rx: &mpsc::Receiver<notify::Result<Event>>, debounce: D
         }
 
         match rx.recv_timeout(remaining) {
-            Ok(Ok(event)) => tracing::debug!("filesystem event: {:?}", event.kind),
+            Ok(Ok(event)) => {
+                tracing::debug!("filesystem event: {:?}", event.kind);
+                paths.extend(event.paths);
+            }
             Ok(Err(err)) => tracing::warn!("filesystem watch error: {err}"),
             Err(mpsc::RecvTimeoutError::Timeout) => return,
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -70,11 +80,11 @@ fn drain_debounce_window(rx: &mpsc::Receiver<notify::Result<Event>>, debounce: D
     }
 }
 
-fn run_polling(interval_ms: u64, tx: UnboundedSender<()>) {
+fn run_polling(interval_ms: u64, tx: UnboundedSender<Vec<PathBuf>>) {
     let interval = Duration::from_millis(interval_ms.max(50));
     loop {
         thread::sleep(interval);
-        if tx.send(()).is_err() {
+        if tx.send(Vec::new()).is_err() {
             return;
         }
     }

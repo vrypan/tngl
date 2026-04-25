@@ -202,12 +202,16 @@ impl FolderState {
             }
         }
 
+        let path = remote.path.clone();
         self.lamport = self.lamport.max(remote.version.lamport);
-        let old = self.entries.insert(remote.path.clone(), remote.clone());
-        self.tree = derive_tree(&self.entries);
-        self.live_tree = derive_live_tree(&self.entries);
+        let old = self.entries.insert(path.clone(), remote.clone());
+        let changed = std::slice::from_ref(&path);
+        update_tree_snapshot(&mut self.tree, &self.entries, changed, |_| true);
+        update_tree_snapshot(&mut self.live_tree, &self.entries, changed, |e| {
+            e.kind != EntryKind::Tombstone
+        });
         Ok(Some(Change {
-            path: remote.path.clone(),
+            path,
             old,
             new: remote,
         }))
@@ -293,6 +297,148 @@ impl FolderState {
 
         self.tree = derive_tree(&self.entries);
         self.live_tree = derive_live_tree(&self.entries);
+        Ok(changes)
+    }
+
+    pub fn apply_paths(&mut self, abs_paths: Vec<PathBuf>) -> io::Result<Vec<Change>> {
+        let canonical_paths: Vec<PathBuf> = abs_paths
+            .into_iter()
+            .filter_map(|p| {
+                fs::canonicalize(&p).ok().or_else(|| {
+                    p.parent()
+                        .and_then(|parent| fs::canonicalize(parent).ok())
+                        .map(|parent| parent.join(p.file_name().unwrap_or_default()))
+                })
+            })
+            .collect();
+
+        if canonical_paths
+            .iter()
+            .any(|p| p == &self.root.join(IGNORE_FILE_NAME))
+        {
+            return self.rescan();
+        }
+
+        let ignore_patterns = load_ignore_patterns(&self.root)?;
+        let mut changes = Vec::new();
+
+        for abs_path in canonical_paths {
+            let relative = match relative_path(&self.root, &abs_path) {
+                Ok(r) if !r.is_empty() => r,
+                _ => continue,
+            };
+
+            if should_ignore(&relative, &ignore_patterns) {
+                if let Some(old) = self.entries.get(&relative).cloned() {
+                    if old.kind != EntryKind::Tombstone {
+                        let new = Entry {
+                            path: relative.clone(),
+                            kind: EntryKind::Tombstone,
+                            content_hash: None,
+                            size: 0,
+                            mode: old.mode,
+                            version: self.next_version(),
+                        };
+                        self.entries.insert(relative.clone(), new.clone());
+                        changes.push(Change { path: relative, old: Some(old), new });
+                    }
+                }
+                continue;
+            }
+
+            match fs::symlink_metadata(&abs_path) {
+                Ok(metadata) if metadata.is_file() => {
+                    let live = Entry {
+                        path: relative.clone(),
+                        kind: EntryKind::File,
+                        content_hash: Some(hash_file(&abs_path)?),
+                        size: metadata.len(),
+                        mode: mode(&metadata),
+                        version: placeholder_version(),
+                    };
+                    match self.entries.get(&relative) {
+                        Some(old) if same_observed_state(old, &live) => {}
+                        old => {
+                            let old = old.cloned();
+                            let mut new = live;
+                            new.version = self.next_version();
+                            self.entries.insert(relative.clone(), new.clone());
+                            changes.push(Change { path: relative, old, new });
+                        }
+                    }
+                }
+                Ok(metadata) if metadata.is_dir() => {
+                    let live = Entry {
+                        path: relative.clone(),
+                        kind: EntryKind::Dir,
+                        content_hash: None,
+                        size: 0,
+                        mode: mode(&metadata),
+                        version: placeholder_version(),
+                    };
+                    match self.entries.get(&relative) {
+                        Some(old) if same_observed_state(old, &live) => {}
+                        old => {
+                            let old = old.cloned();
+                            let mut new = live;
+                            new.version = self.next_version();
+                            self.entries.insert(relative.clone(), new.clone());
+                            changes.push(Change { path: relative.clone(), old, new });
+                        }
+                    }
+                    let mut dir_entries = BTreeMap::new();
+                    scan_dir(&self.root, &abs_path, &ignore_patterns, &mut dir_entries)?;
+                    for (path, live) in dir_entries {
+                        match self.entries.get(&path) {
+                            Some(old) if same_observed_state(old, &live) => {}
+                            old => {
+                                let old = old.cloned();
+                                let mut new = live;
+                                new.version = self.next_version();
+                                self.entries.insert(path.clone(), new.clone());
+                                changes.push(Change { path, old, new });
+                            }
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    let prefix = format!("{relative}/");
+                    let to_tombstone: Vec<String> = self
+                        .entries
+                        .keys()
+                        .filter(|p| **p == relative || p.starts_with(&prefix))
+                        .cloned()
+                        .collect();
+                    for path in to_tombstone {
+                        let old = self.entries.get(&path).cloned().unwrap();
+                        if old.kind == EntryKind::Tombstone {
+                            continue;
+                        }
+                        let new = Entry {
+                            path: path.clone(),
+                            kind: EntryKind::Tombstone,
+                            content_hash: None,
+                            size: 0,
+                            mode: old.mode,
+                            version: self.next_version(),
+                        };
+                        self.entries.insert(path.clone(), new.clone());
+                        changes.push(Change { path, old: Some(old), new });
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        if !changes.is_empty() {
+            let changed_paths: Vec<String> = changes.iter().map(|c| c.path.clone()).collect();
+            update_tree_snapshot(&mut self.tree, &self.entries, &changed_paths, |_| true);
+            update_tree_snapshot(&mut self.live_tree, &self.entries, &changed_paths, |e| {
+                e.kind != EntryKind::Tombstone
+            });
+        }
+
         Ok(changes)
     }
 
@@ -646,6 +792,92 @@ fn derive_tree(entries: &BTreeMap<String, Entry>) -> TreeSnapshot {
 
 fn derive_live_tree(entries: &BTreeMap<String, Entry>) -> TreeSnapshot {
     derive_tree_with(entries, |entry| entry.kind != EntryKind::Tombstone)
+}
+
+fn update_tree_snapshot(
+    snapshot: &mut TreeSnapshot,
+    entries: &BTreeMap<String, Entry>,
+    changed_paths: &[String],
+    include: impl Fn(&Entry) -> bool,
+) {
+    // Collect dirty node paths: ancestors of every changed path, plus the
+    // changed paths themselves in case they are dir nodes.
+    let mut dirty: BTreeSet<String> = BTreeSet::new();
+    for path in changed_paths {
+        dirty.insert(path.clone());
+        dirty.extend(ancestors(path));
+    }
+
+    // When a dir node is removed, all its descendant nodes are also stale.
+    for path in changed_paths {
+        if !snapshot.nodes.contains_key(path) {
+            continue;
+        }
+        let still_included = entries.get(path).map_or(false, |e| include(e));
+        if still_included {
+            continue;
+        }
+        let prefix = format!("{path}/");
+        let descendants: Vec<String> = snapshot
+            .nodes
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for desc in descendants {
+            dirty.extend(ancestors(&desc));
+            dirty.insert(desc);
+        }
+    }
+
+    // Index entries by their parent node path for O(1) lookup per node.
+    let mut by_parent: BTreeMap<String, Vec<&Entry>> = BTreeMap::new();
+    for entry in entries.values() {
+        if include(entry) {
+            by_parent
+                .entry(parent_path(&entry.path))
+                .or_default()
+                .push(entry);
+        }
+    }
+
+    // Process dirty nodes bottom-up (reverse lex = deepest first) so that
+    // when a parent reads its children hashes they are already up to date.
+    for node_path in dirty.iter().rev() {
+        let direct_entries: BTreeMap<String, [u8; 32]> = by_parent
+            .get(node_path)
+            .map(|es| {
+                es.iter()
+                    .map(|e| (basename(&e.path), hash_entry(e)))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let direct_children: BTreeMap<String, [u8; 32]> = snapshot
+            .nodes
+            .iter()
+            .filter(|(k, _)| !k.is_empty() && &parent_path(k) == node_path)
+            .map(|(k, v)| (basename(k), v.hash))
+            .collect();
+
+        if node_path.is_empty() || !direct_entries.is_empty() || !direct_children.is_empty() {
+            let prefix = display_prefix(node_path);
+            let hash = hash_node(&prefix, &direct_entries, &direct_children);
+            snapshot.nodes.insert(
+                node_path.clone(),
+                TreeNode {
+                    prefix,
+                    entries: direct_entries,
+                    children: direct_children,
+                    hash,
+                },
+            );
+        } else {
+            snapshot.nodes.remove(node_path);
+        }
+    }
+
+    snapshot.root_hash = snapshot.nodes.get("").map(|n| n.hash).unwrap_or([0; 32]);
 }
 
 fn derive_tree_with(
@@ -1019,6 +1251,115 @@ mod tests {
         assert_eq!(change.verb(), "delete");
         assert!(!tmp.path().join("gone.txt").exists());
         assert_eq!(state.entry("gone.txt").unwrap().kind, EntryKind::Tombstone);
+    }
+
+    #[test]
+    fn apply_paths_handles_create_modify_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+        let empty_hash = state.root_hash();
+
+        let file = tmp.path().join("a.txt");
+        fs::write(&file, "hello").unwrap();
+        let changes = state.apply_paths(vec![file.clone()]).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].verb(), "file new");
+        assert_ne!(state.root_hash(), empty_hash);
+
+        fs::write(&file, "world").unwrap();
+        let changes = state.apply_paths(vec![file.clone()]).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].verb(), "file update");
+
+        fs::remove_file(&file).unwrap();
+        let changes = state.apply_paths(vec![file]).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].verb(), "delete");
+        assert_eq!(changes[0].new.kind, EntryKind::Tombstone);
+    }
+
+    #[test]
+    fn apply_paths_tombstones_dir_descendants_on_removal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("a.txt"), "a").unwrap();
+        fs::write(sub.join("b.txt"), "b").unwrap();
+
+        let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+        assert_eq!(state.entries.get("sub/a.txt").unwrap().kind, EntryKind::File);
+
+        fs::remove_dir_all(&sub).unwrap();
+        let changes = state.apply_paths(vec![sub]).unwrap();
+        assert!(changes.len() >= 3); // sub, sub/a.txt, sub/b.txt
+        for c in &changes {
+            assert_eq!(c.new.kind, EntryKind::Tombstone);
+        }
+    }
+
+    #[test]
+    fn apply_paths_scans_new_directory_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+
+        let sub = tmp.path().join("sub");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("c.txt"), "c").unwrap();
+
+        let changes = state.apply_paths(vec![sub]).unwrap();
+        let paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
+        assert!(paths.contains(&"sub"));
+        assert!(paths.contains(&"sub/c.txt"));
+    }
+
+    #[test]
+    fn apply_paths_falls_back_to_rescan_when_notngl_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("keep.txt"), "keep").unwrap();
+        let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+
+        let notngl = tmp.path().join(".notngl");
+        fs::write(&notngl, "keep.txt\n").unwrap();
+        let changes = state.apply_paths(vec![notngl]).unwrap();
+
+        assert!(changes.iter().any(|c| c.path == ".notngl"));
+        assert_eq!(
+            state.entries.get("keep.txt").unwrap().kind,
+            EntryKind::Tombstone
+        );
+    }
+
+    #[test]
+    fn incremental_tree_matches_full_rebuild() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("sub")).unwrap();
+        fs::write(tmp.path().join("sub/a.txt"), "initial").unwrap();
+        fs::write(tmp.path().join("b.txt"), "b").unwrap();
+
+        let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+
+        // Modify via apply_paths, then confirm rescan sees no further changes
+        // (meaning incremental state is identical to a fresh scan).
+        fs::write(tmp.path().join("sub/a.txt"), "modified").unwrap();
+        state.apply_paths(vec![tmp.path().join("sub/a.txt")]).unwrap();
+        let incremental_root = state.root_hash();
+        let incremental_live = state.live_root_hash();
+
+        let further_changes = state.rescan().unwrap();
+        assert!(further_changes.is_empty(), "rescan found unexpected changes after apply_paths");
+        assert_eq!(state.root_hash(), incremental_root);
+        assert_eq!(state.live_root_hash(), incremental_live);
+
+        // Delete a file, then verify the same way.
+        fs::remove_file(tmp.path().join("b.txt")).unwrap();
+        state.apply_paths(vec![tmp.path().join("b.txt")]).unwrap();
+        let after_delete_root = state.root_hash();
+        let after_delete_live = state.live_root_hash();
+
+        let further_changes = state.rescan().unwrap();
+        assert!(further_changes.is_empty(), "rescan found unexpected changes after delete");
+        assert_eq!(state.root_hash(), after_delete_root);
+        assert_eq!(state.live_root_hash(), after_delete_live);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use crate::group::{self, GroupState, MemberEntry};
 use crate::protocol::{
-    RequestMessage, ResponseMessage, assert_eof, close_send, read_frame, write_frame,
+    RequestMessage, ResponseMessage, assert_eof, close_send, read_frame, read_object_bytes,
+    write_frame,
 };
 use crate::state::{Entry, FolderState, TreeNode, hex};
 use iroh::endpoint::{Connection, ConnectionError};
@@ -134,18 +135,15 @@ impl RpcClient {
             request_id,
             content_hash,
         };
-        match self.round_trip(peer, request).await? {
-            ResponseMessage::Object {
-                request_id: actual,
-                bytes,
-            } if actual == request_id => Ok(bytes),
-            ResponseMessage::Error {
-                request_id: actual,
-                message,
-            } if actual == request_id => Err(io::Error::other(message)),
-            response => Err(io::Error::other(format!(
-                "unexpected GetObject response from {peer}: {response:?}"
-            ))),
+        let connection = self.connection(peer).await?;
+        match get_object_on_connection(&connection, peer, request_id, &request).await {
+            Ok(bytes) => Ok(bytes),
+            Err(first_err) => {
+                self.drop_connection(peer).await;
+                tracing::debug!(target: "tngl::rpc", %peer, "retrying GetObject after: {first_err}");
+                let connection = self.connection(peer).await?;
+                get_object_on_connection(&connection, peer, request_id, &request).await
+            }
         }
     }
 
@@ -263,14 +261,67 @@ async fn handle_connection(
             .await
             .map_err(|err| io::Error::other(format!("trailing bytes from {peer}: {err}")))?;
 
-        let response = handle_request(request, peer, &state, &group, &invites_path, &events).await;
-        tracing::debug!(target: "tngl::rpc", %peer, "send {:?}", response);
-        write_frame(&mut send, &response)
-            .await
-            .map_err(|err| io::Error::other(format!("write response to {peer}: {err}")))?;
+        if let RequestMessage::GetObject {
+            request_id,
+            content_hash,
+        } = request
+        {
+            handle_get_object(&mut send, request_id, content_hash, peer, &state, &group).await?;
+        } else {
+            let response =
+                handle_request(request, peer, &state, &group, &invites_path, &events).await;
+            tracing::debug!(target: "tngl::rpc", %peer, "send {:?}", response);
+            write_frame(&mut send, &response)
+                .await
+                .map_err(|err| io::Error::other(format!("write response to {peer}: {err}")))?;
+        }
         close_send(&mut send)
             .await
             .map_err(|err| io::Error::other(format!("close response stream to {peer}: {err}")))?;
+    }
+}
+
+async fn handle_get_object(
+    send: &mut iroh::endpoint::SendStream,
+    request_id: u64,
+    content_hash: [u8; 32],
+    peer: PublicKey,
+    state: &Arc<RwLock<FolderState>>,
+    group: &Arc<RwLock<GroupState>>,
+) -> io::Result<()> {
+    if !group.read().await.is_active_member(&peer) {
+        return write_frame(
+            send,
+            &ResponseMessage::Error {
+                request_id,
+                message: "peer is not a group member".to_string(),
+            },
+        )
+        .await;
+    }
+
+    let path = state.read().await.object_path(content_hash);
+
+    match path {
+        None => {
+            write_frame(
+                send,
+                &ResponseMessage::Error {
+                    request_id,
+                    message: format!("object {} not found", hex(content_hash)),
+                },
+            )
+            .await
+        }
+        Some(path) => {
+            let mut file = tokio::fs::File::open(&path)
+                .await
+                .map_err(|err| io::Error::other(format!("open {}: {err}", path.display())))?;
+            let size = file.metadata().await?.len();
+            write_frame(send, &ResponseMessage::ObjectHeader { request_id, size }).await?;
+            tokio::io::copy(&mut file, send).await?;
+            Ok(())
+        }
     }
 }
 
@@ -363,34 +414,7 @@ async fn handle_request(
                 entry: state.entry(&path),
             }
         }
-        RequestMessage::GetObject {
-            request_id,
-            content_hash,
-        } => {
-            if !group.read().await.is_active_member(&peer) {
-                return ResponseMessage::Error {
-                    request_id,
-                    message: "peer is not a group member".to_string(),
-                };
-            }
-            let path = {
-                let state = state.read().await;
-                state.object_path(content_hash)
-            };
-            match path {
-                Some(path) => match tokio::fs::read(&path).await {
-                    Ok(bytes) => ResponseMessage::Object { request_id, bytes },
-                    Err(err) => ResponseMessage::Error {
-                        request_id,
-                        message: format!("read object {} failed: {err}", hex(content_hash)),
-                    },
-                },
-                None => ResponseMessage::Error {
-                    request_id,
-                    message: format!("object {} not found", hex(content_hash)),
-                },
-            }
-        }
+        RequestMessage::GetObject { .. } => unreachable!("handled before handle_request"),
     }
 }
 
@@ -418,6 +442,54 @@ async fn round_trip_on_connection(
         .await
         .map_err(|err| io::Error::other(format!("trailing response from {peer}: {err}")))?;
     Ok(response)
+}
+
+async fn get_object_on_connection(
+    connection: &Connection,
+    peer: PublicKey,
+    request_id: u64,
+    request: &RequestMessage,
+) -> io::Result<Vec<u8>> {
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .map_err(|err| io::Error::other(format!("open stream to {peer}: {err}")))?;
+
+    write_frame(&mut send, request)
+        .await
+        .map_err(|err| io::Error::other(format!("write request to {peer}: {err}")))?;
+    close_send(&mut send)
+        .await
+        .map_err(|err| io::Error::other(format!("close request stream to {peer}: {err}")))?;
+
+    let header: ResponseMessage = read_frame(&mut recv)
+        .await
+        .map_err(|err| io::Error::other(format!("read object header from {peer}: {err}")))?;
+
+    let size = match header {
+        ResponseMessage::ObjectHeader {
+            request_id: actual,
+            size,
+        } if actual == request_id => size,
+        ResponseMessage::Error {
+            request_id: actual,
+            message,
+        } if actual == request_id => return Err(io::Error::other(message)),
+        response => {
+            return Err(io::Error::other(format!(
+                "unexpected GetObject response from {peer}: {response:?}"
+            )));
+        }
+    };
+
+    let bytes = read_object_bytes(&mut recv, size)
+        .await
+        .map_err(|err| io::Error::other(format!("read object bytes from {peer}: {err}")))?;
+    assert_eof(&mut recv)
+        .await
+        .map_err(|err| io::Error::other(format!("trailing bytes from {peer}: {err}")))?;
+
+    Ok(bytes)
 }
 
 fn is_routine_connection_close(err: &ConnectionError) -> bool {
