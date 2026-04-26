@@ -1,7 +1,8 @@
+use crate::message::TreeHint;
 use crate::rpc::RpcClient;
-use crate::state::{Change, EntryKind, FolderState, TreeNode, hex};
+use crate::state::{Change, EntryKind, FolderState, TreeNode, entry_hash, hex, tree_node_hash};
 use iroh::PublicKey;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,6 +17,27 @@ pub async fn reconcile_with_peer(
     peer: PublicKey,
 ) -> io::Result<Vec<Change>> {
     let (remote_root, remote_live_root, remote_lamport) = rpc.get_root(peer).await?;
+    reconcile_with_advertised_root(
+        rpc,
+        state,
+        peer,
+        remote_root,
+        remote_live_root,
+        remote_lamport,
+        None,
+    )
+    .await
+}
+
+pub async fn reconcile_with_advertised_root(
+    rpc: RpcClient,
+    state: Arc<RwLock<FolderState>>,
+    peer: PublicKey,
+    remote_root: [u8; 32],
+    remote_live_root: [u8; 32],
+    remote_lamport: u64,
+    hint: Option<TreeHint>,
+) -> io::Result<Vec<Change>> {
     tracing::info!(
         "sync peer={} remote_lamport={} state_root={} live_root={}",
         peer,
@@ -32,6 +54,7 @@ pub async fn reconcile_with_peer(
         return Ok(Vec::new());
     }
 
+    let hinted_nodes = hint.map(HintedNodes::from).unwrap_or_default();
     let mut changes = Vec::new();
     let mut stack = vec![("".to_string(), remote_root)];
     while let Some((prefix, remote_hash)) = stack.pop() {
@@ -39,6 +62,7 @@ pub async fn reconcile_with_peer(
             &rpc,
             &state,
             peer,
+            &hinted_nodes,
             &prefix,
             remote_hash,
             &mut changes,
@@ -73,6 +97,7 @@ async fn reconcile_node(
     rpc: &RpcClient,
     state: &Arc<RwLock<FolderState>>,
     peer: PublicKey,
+    hinted_nodes: &HintedNodes,
     prefix: &str,
     expected_remote_hash: [u8; 32],
     changes: &mut Vec<Change>,
@@ -89,10 +114,13 @@ async fn reconcile_node(
         return Ok(());
     }
 
-    let Some(remote_node) = rpc.get_node(peer, prefix).await? else {
-        return Err(io::Error::other(format!(
-            "peer {peer} did not return node for prefix {prefix:?}"
-        )));
+    let remote_node = match hinted_nodes.get(prefix, expected_remote_hash) {
+        Some(node) => node,
+        None => rpc.get_node(peer, prefix).await?.ok_or_else(|| {
+            io::Error::other(format!(
+                "peer {peer} did not return node for prefix {prefix:?}"
+            ))
+        })?,
     };
     if remote_node.hash != expected_remote_hash {
         return Err(io::Error::other(format!(
@@ -115,6 +143,32 @@ async fn reconcile_node(
     .await?;
     queue_changed_children(prefix, local_node.as_ref(), &remote_node, stack);
     Ok(())
+}
+
+#[derive(Default)]
+struct HintedNodes {
+    nodes: BTreeMap<String, TreeNode>,
+}
+
+impl HintedNodes {
+    fn get(&self, prefix: &str, expected_hash: [u8; 32]) -> Option<TreeNode> {
+        self.nodes
+            .get(&normalize_prefix(prefix))
+            .filter(|node| node.hash == expected_hash)
+            .cloned()
+    }
+}
+
+impl From<TreeHint> for HintedNodes {
+    fn from(hint: TreeHint) -> Self {
+        let nodes = hint
+            .nodes
+            .into_iter()
+            .filter(|node| tree_node_hash(node) == node.hash)
+            .map(|node| (normalize_prefix(&node.prefix), node))
+            .collect();
+        Self { nodes }
+    }
 }
 
 async fn reconcile_entries(
@@ -141,6 +195,13 @@ async fn reconcile_entries(
                 "peer {peer} did not return entry {path}"
             )));
         };
+        if entry_hash(&remote_entry) != *remote_hash {
+            return Err(io::Error::other(format!(
+                "peer {peer} returned stale entry {path}: expected {}, got {}",
+                hex(*remote_hash),
+                hex(entry_hash(&remote_entry))
+            )));
+        }
         if !state.read().await.should_accept_remote(&remote_entry) {
             continue;
         }
@@ -229,4 +290,8 @@ fn join_path(prefix: &str, name: &str) -> String {
     } else {
         format!("{prefix}/{name}")
     }
+}
+
+fn normalize_prefix(prefix: &str) -> String {
+    prefix.trim_matches('/').to_string()
 }

@@ -1,4 +1,5 @@
 use crate::group::MemberEntry;
+use crate::state::TreeNode;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -16,11 +17,18 @@ pub enum GossipMessage {
         state_root: [u8; 32],
         live_root: [u8; 32],
         lamport: u64,
+        hint: Option<TreeHint>,
     },
     Peers {
         origin: String,
         members: Vec<MemberEntry>,
     },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TreeHint {
+    pub truncated: bool,
+    pub nodes: Vec<TreeNode>,
 }
 
 impl GossipMessage {
@@ -70,11 +78,18 @@ mod tests {
             state_root: [1; 32],
             live_root: [2; 32],
             lamport: 8,
+            hint: Some(TreeHint {
+                truncated: false,
+                nodes: Vec::new(),
+            }),
         };
 
         let parsed = GossipMessage::from_bytes(&message.to_bytes()).unwrap();
         match parsed {
-            GossipMessage::FilesystemChanged { lamport, .. } => assert_eq!(lamport, 8),
+            GossipMessage::FilesystemChanged { lamport, hint, .. } => {
+                assert_eq!(lamport, 8);
+                assert!(hint.is_some());
+            }
             _ => panic!("wrong message variant"),
         }
     }

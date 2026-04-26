@@ -7,7 +7,7 @@ mod sync;
 mod watcher;
 
 use crate::group::GroupState;
-use crate::message::GossipMessage;
+use crate::message::{GossipMessage, TreeHint};
 use crate::state::{Change, FolderState, hex};
 use clap::{Parser, Subcommand};
 use futures_lite::StreamExt;
@@ -15,6 +15,7 @@ use iroh::protocol::Router;
 use iroh::{Endpoint, PublicKey, SecretKey};
 use iroh_gossip::api::{ApiError, Event as GossipEvent, GossipSender};
 use iroh_gossip::{ALPN as GOSSIP_ALPN, Gossip, TopicId};
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -25,6 +26,7 @@ use tokio::sync::{RwLock, mpsc};
 const KEY_FILE: &str = "private.key";
 const PEERS_FILE: &str = "peers.json";
 const INVITES_FILE: &str = "invites.json";
+const MAX_FILESYSTEM_CHANGED_BYTES: usize = 3_000;
 
 #[derive(Parser, Debug)]
 #[command(name = "lil", about = "lilsync folder sync daemon")]
@@ -267,7 +269,9 @@ async fn run_sync(
                         Ok(changes) if changes.is_empty() => None,
                         Ok(changes) => {
                             print_changes(before_state, before_live, &state, &changes);
-                            Some((changes, StateSnapshot::from_state(&state)))
+                            let snapshot = StateSnapshot::from_state(&state);
+                            let hint = build_tree_hint(&state, &changes, &snapshot, &local_origin);
+                            Some((changes, snapshot, hint))
                         }
                         Err(err) => {
                             tracing::warn!("scan failed: {err}");
@@ -275,9 +279,9 @@ async fn run_sync(
                         }
                     }
                 };
-                if let Some((changes, snapshot)) = update {
+                if let Some((changes, snapshot, hint)) = update {
                     tracing::info!("filesystem changed paths={}", changes.len());
-                    publish_filesystem_changed(&sender, &snapshot, &local_origin).await;
+                    publish_filesystem_changed(&sender, &snapshot, &local_origin, hint).await;
                 }
             }
             event = receiver.next() => {
@@ -352,12 +356,18 @@ async fn publish_sync_state(sender: &GossipSender, state: &StateSnapshot, origin
     publish(sender, message).await;
 }
 
-async fn publish_filesystem_changed(sender: &GossipSender, state: &StateSnapshot, origin: &str) {
+async fn publish_filesystem_changed(
+    sender: &GossipSender,
+    state: &StateSnapshot,
+    origin: &str,
+    hint: Option<TreeHint>,
+) {
     let message = GossipMessage::FilesystemChanged {
         origin: origin.to_string(),
         state_root: state.state_root,
         live_root: state.live_root,
         lamport: state.lamport,
+        hint,
     };
     publish(sender, message).await;
 }
@@ -369,6 +379,84 @@ async fn publish_peers(sender: &GossipSender, group: Arc<RwLock<GroupState>>, or
         members,
     };
     publish(sender, message).await;
+}
+
+fn build_tree_hint(
+    state: &FolderState,
+    changes: &[Change],
+    snapshot: &StateSnapshot,
+    origin: &str,
+) -> Option<TreeHint> {
+    let mut prefixes = Vec::new();
+    let mut seen = BTreeSet::new();
+    push_hint_prefix(&mut prefixes, &mut seen, "");
+    for change in changes {
+        for prefix in path_prefixes(&change.path) {
+            push_hint_prefix(&mut prefixes, &mut seen, &prefix);
+        }
+    }
+
+    let mut hint = TreeHint {
+        truncated: false,
+        nodes: Vec::new(),
+    };
+    for prefix in prefixes {
+        let Some(node) = state.node(&prefix) else {
+            continue;
+        };
+        let mut candidate = hint.clone();
+        candidate.nodes.push(node);
+        if filesystem_changed_len(snapshot, origin, Some(&candidate))
+            <= MAX_FILESYSTEM_CHANGED_BYTES
+        {
+            hint = candidate;
+        } else {
+            hint.truncated = true;
+            break;
+        }
+    }
+
+    if hint.nodes.is_empty() {
+        None
+    } else {
+        Some(hint)
+    }
+}
+
+fn filesystem_changed_len(
+    snapshot: &StateSnapshot,
+    origin: &str,
+    hint: Option<&TreeHint>,
+) -> usize {
+    GossipMessage::FilesystemChanged {
+        origin: origin.to_string(),
+        state_root: snapshot.state_root,
+        live_root: snapshot.live_root,
+        lamport: snapshot.lamport,
+        hint: hint.cloned(),
+    }
+    .to_bytes()
+    .len()
+}
+
+fn push_hint_prefix(prefixes: &mut Vec<String>, seen: &mut BTreeSet<String>, prefix: &str) {
+    let normalized = prefix.trim_matches('/').to_string();
+    if seen.insert(normalized.clone()) {
+        prefixes.push(normalized);
+    }
+}
+
+fn path_prefixes(path: &str) -> Vec<String> {
+    let parts: Vec<&str> = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|p| !p.is_empty())
+        .collect();
+    let mut out = Vec::new();
+    for end in 1..=parts.len() {
+        out.push(parts[..end].join("/"));
+    }
+    out
 }
 
 async fn publish(sender: &GossipSender, message: GossipMessage) {
@@ -482,11 +570,16 @@ fn print_remote_message(message: &GossipMessage, state: &StateSnapshot) {
             state_root,
             live_root,
             lamport,
+            hint,
         } => {
+            let hint_nodes = hint.as_ref().map(|hint| hint.nodes.len()).unwrap_or(0);
+            let hint_truncated = hint.as_ref().map(|hint| hint.truncated).unwrap_or(false);
             tracing::info!(
-                "peer filesystem origin={} lamport={} state_root={} live_root={} state_match={} live_match={}",
+                "peer filesystem origin={} lamport={} hint_nodes={} hint_truncated={} state_root={} live_root={} state_match={} live_match={}",
                 origin,
                 lamport,
+                hint_nodes,
+                hint_truncated,
                 hex(*state_root),
                 hex(*live_root),
                 *state_root == state.state_root,
@@ -507,21 +600,25 @@ fn maybe_probe_remote_rpc(
     sender: GossipSender,
     local_origin: String,
 ) {
-    let (origin, remote_state_root, remote_live_root) = match message {
-        GossipMessage::SyncState {
-            origin,
-            state_root,
-            live_root,
-            ..
-        }
-        | GossipMessage::FilesystemChanged {
-            origin,
-            state_root,
-            live_root,
-            ..
-        } => (origin, state_root, live_root),
-        GossipMessage::Peers { .. } => return,
-    };
+    let (origin, remote_state_root, remote_live_root, remote_lamport, hint, use_advertised_root) =
+        match message {
+            GossipMessage::SyncState {
+                origin,
+                state_root,
+                live_root,
+                lamport,
+                ..
+            } => (origin, state_root, live_root, lamport, None, false),
+            GossipMessage::FilesystemChanged {
+                origin,
+                state_root,
+                live_root,
+                lamport,
+                hint,
+                ..
+            } => (origin, state_root, live_root, lamport, hint, true),
+            GossipMessage::Peers { .. } => return,
+        };
     let Ok(peer) = origin.parse::<PublicKey>() else {
         tracing::warn!("cannot RPC probe peer with invalid origin {origin}");
         return;
@@ -536,7 +633,22 @@ fn maybe_probe_remote_rpc(
             return;
         }
 
-        match sync::reconcile_with_peer(rpc_client, Arc::clone(&state), peer).await {
+        let result = if use_advertised_root {
+            sync::reconcile_with_advertised_root(
+                rpc_client,
+                Arc::clone(&state),
+                peer,
+                remote_state_root,
+                remote_live_root,
+                remote_lamport,
+                hint,
+            )
+            .await
+        } else {
+            sync::reconcile_with_peer(rpc_client, Arc::clone(&state), peer).await
+        };
+
+        match result {
             Ok(changes) if changes.is_empty() => {
                 tracing::info!("sync peer={} no changes applied", peer);
             }
@@ -634,9 +746,13 @@ fn summarize_message(message: &GossipMessage) -> String {
             hex(*state_root)
         ),
         GossipMessage::FilesystemChanged {
-            origin, lamport, ..
+            origin,
+            lamport,
+            hint,
+            ..
         } => {
-            format!("filesystem-changed origin={origin} lamport={lamport}")
+            let hint_nodes = hint.as_ref().map(|hint| hint.nodes.len()).unwrap_or(0);
+            format!("filesystem-changed origin={origin} lamport={lamport} hint_nodes={hint_nodes}")
         }
         GossipMessage::Peers { origin, members } => {
             format!("peers origin={origin} members={}", members.len())
@@ -885,5 +1001,25 @@ mod tests {
         );
         drop(first);
         let _third = acquire_daemon_lock(tmp.path()).unwrap();
+    }
+
+    #[test]
+    fn filesystem_tree_hint_stays_under_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+
+        let dir = tmp.path().join("a").join("b");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("c.txt"), "hello").unwrap();
+
+        let changes = state.apply_paths(vec![tmp.path().join("a")]).unwrap();
+        let snapshot = StateSnapshot::from_state(&state);
+        let hint = build_tree_hint(&state, &changes, &snapshot, "node-a");
+
+        assert!(hint.as_ref().is_some_and(|hint| !hint.nodes.is_empty()));
+        assert!(
+            filesystem_changed_len(&snapshot, "node-a", hint.as_ref())
+                <= MAX_FILESYSTEM_CHANGED_BYTES
+        );
     }
 }

@@ -1080,6 +1080,14 @@ pub fn hex(hash: [u8; 32]) -> String {
     hash.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+pub fn entry_hash(entry: &Entry) -> [u8; 32] {
+    hash_entry(entry)
+}
+
+pub fn tree_node_hash(node: &TreeNode) -> [u8; 32] {
+    hash_node(&node.prefix, &node.entries, &node.children)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
