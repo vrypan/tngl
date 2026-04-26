@@ -249,6 +249,7 @@ impl FolderState {
     }
 
     pub fn rescan(&mut self) -> io::Result<Vec<Change>> {
+        let ignore_patterns = load_ignore_patterns(&self.root)?;
         let live = scan_folder(&self.root)?;
         let mut changes = Vec::new();
         let mut seen = BTreeSet::new();
@@ -261,6 +262,9 @@ impl FolderState {
         let old_paths: Vec<String> = self.entries.keys().cloned().collect();
         for path in old_paths {
             if seen.contains(&path) {
+                continue;
+            }
+            if should_ignore(&path, &ignore_patterns) {
                 continue;
             }
             let Some(old) = self.entries.get(&path).cloned() else {
@@ -327,14 +331,6 @@ impl FolderState {
         changes: &mut Vec<Change>,
     ) -> io::Result<()> {
         if should_ignore(relative, ignore_patterns) {
-            if let Some(old) = self.entries.get(relative).cloned() {
-                if old.kind != EntryKind::Tombstone {
-                    let version = self.next_version();
-                    let new = tombstone_entry(relative, &old, version);
-                    self.entries.insert(relative.to_string(), new.clone());
-                    changes.push(Change { path: relative.to_string(), old: Some(old), new });
-                }
-            }
             return Ok(());
         }
 
@@ -1149,7 +1145,7 @@ mod tests {
     }
 
     #[test]
-    fn newly_ignored_path_becomes_tombstone() {
+    fn newly_ignored_path_stays_in_state() {
         let tmp = tempfile::tempdir().unwrap();
         fs::write(tmp.path().join("keep.txt"), "keep").unwrap();
 
@@ -1159,9 +1155,11 @@ mod tests {
         fs::write(tmp.path().join(".nolil"), "keep.txt\n").unwrap();
         let changes = state.rescan().unwrap();
 
-        assert!(changes.iter().any(|change| change.path == ".nolil"));
-        let ignored = state.entries.get("keep.txt").unwrap();
-        assert_eq!(ignored.kind, EntryKind::Tombstone);
+        // .nolil changed but keep.txt should remain live — ignore stops local
+        // tracking without broadcasting a deletion to peers.
+        assert!(changes.iter().any(|c| c.path == ".nolil"));
+        let entry = state.entries.get("keep.txt").unwrap();
+        assert_eq!(entry.kind, EntryKind::File);
     }
 
     #[test]
@@ -1288,9 +1286,10 @@ mod tests {
         let changes = state.apply_paths(vec![notngl]).unwrap();
 
         assert!(changes.iter().any(|c| c.path == ".nolil"));
+        // keep.txt is now ignored but stays live in state — no deletion broadcast
         assert_eq!(
             state.entries.get("keep.txt").unwrap().kind,
-            EntryKind::Tombstone
+            EntryKind::File
         );
     }
 
