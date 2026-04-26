@@ -57,6 +57,15 @@ Degree: functional. There is no migration layer for older state formats.
 
 Degree: functional for basic peer discovery and event propagation. Gossip messages are not authenticated beyond the iroh node identity of the connection layer, and there is no replay protection or membership signature scheme.
 
+### Persistent Entry State
+
+- All tracked entries (including tombstones) are persisted to `<folder>/.lil/entries.bin` in bincode format.
+- On startup, persisted entries are loaded before the filesystem scan so tombstones survive restarts and deleted files are not re-synced.
+- Entry state is written after every watcher batch (`apply_paths`) and after each reconciliation pass.
+- Tombstone GC runs on startup: tombstones with `version.lamport <= min(sync_lamport across all active peers)` are removed. `sync_lamport` per peer is persisted in `peers.json` and updated after each successful reconciliation.
+
+Degree: functional. GC is conservative — a tombstone is only removed when all known active peers have confirmed they synced past it. Peers that were never online together may retain stale tombstones indefinitely until they sync.
+
 ### Minimal RPC API
 
 Implemented over a custom `lil/rpc/1` ALPN:
@@ -80,7 +89,13 @@ Degree: functional. Tree/file RPCs are gated to active group members. The join R
 - Remote directories and tombstones are applied locally.
 - File bytes are verified against the advertised content hash before being applied.
 
-Degree: functional for pull-based reconciliation. File objects are transferred as raw bytes over the existing QUIC stream: the server streams directly from disk using `tokio::io::copy` with no full-file buffer; the client streams to a tmp file in 256 KB chunks with incremental BLAKE3 verification, then renames into place. Up to 8 file downloads run in parallel per reconciliation pass using `tokio::task::JoinSet` and a `Semaphore`. Conflict handling beyond deterministic version ordering is not implemented. The change-log fast path from `NEXT.md` is not implemented.
+Degree: functional for pull-based reconciliation. File objects are transferred as raw bytes over the existing QUIC stream: the server streams directly from disk using `tokio::io::copy` with no full-file buffer; the client streams to a tmp file in 256 KB chunks with incremental BLAKE3 verification, then renames into place. Up to 8 file downloads run in parallel per reconciliation pass using `tokio::task::JoinSet` and a `Semaphore`. A post-reconciliation sweep re-runs `tombstone_descendants` on every accepted tombstone path to catch entries installed concurrently during the reconciliation window. Conflict handling beyond deterministic version ordering is not implemented. The change-log fast path is not implemented.
+
+Tombstone correctness guarantees:
+
+- Ignored paths (`.nolil`) never produce tombstones; local ignore rules do not propagate deletions to peers.
+- A directory tombstone applied from a remote peer recursively tombstones all live child entries and deletes the directory tree from disk.
+- `tombstone_descendants` (local delete path) covers all entries currently in state; the post-reconciliation sweep closes the window for entries added after the tombstone was first applied.
 
 ### Group Joining
 
@@ -108,7 +123,7 @@ Degree: functional for adding and removing peers. Peers can announce a human-rea
 
 ## Verified
 
-- Unit tests cover state hashing, tombstones, ignore rules, key reuse, daemon locking, invite consumption, peer merge behavior, gossip message serialization, and remote apply behavior.
+- Unit tests cover state hashing, tombstones, ignore rules, key reuse, daemon locking, invite consumption, peer merge behavior, gossip message serialization, remote apply behavior, tombstone persistence across restarts, and tombstone GC threshold behaviour.
 - Latest verification run:
 
 ```text
@@ -127,39 +142,44 @@ cargo check
 
 ## Known Gaps
 
-- No durable entry index, tree node store, object store, or append-only change log yet.
 - No change-log synchronization fast path.
 - No push reconciliation; current sync is pull-based when a remote mismatch is observed.
 - No explicit conflict file strategy when concurrent versions tie in unexpected ways.
 - No peer revocation workflow (removal is trust-based; no signed membership ledger).
 - No signed membership ledger.
 - No encrypted file transfer or application-level authorization beyond iroh node identity plus local peer membership.
-- No CLI commands for inspecting current group state.
 - No long-running integration test harness yet.
 - NAT traversal warnings from iroh/quinn can still appear on new connections; current RPC connection reuse reduces repeated RPC warnings but does not eliminate the underlying warning.
 
 ## Current Usage
 
-Create a new group or run an existing group member:
+Start syncing a folder (creates a new group on first run):
 
 ```text
-cargo run -- --folder ./tmp1
+lil sync ./tmp1
+lil sync ./tmp1 --name alice --poll
 ```
 
 Create an invite:
 
 ```text
-cargo run -- --folder ./tmp1 --invite --expire-secs 3600
+lil invite ./tmp1 --expire-secs 3600
 ```
 
-Join from another folder:
+Join from another folder (starts the daemon after a successful join):
 
 ```text
-cargo run -- --folder ./tmp2 --ticket <86-char-base62-ticket>
+lil join ./tmp2 <86-char-base62-ticket>
 ```
 
-Use polling fallback:
+List known peers:
 
 ```text
-cargo run -- --folder ./tmp1 --poll
+lil peers ./tmp1
+```
+
+Remove a peer by ID or name:
+
+```text
+lil remove ./tmp1 <id-or-name>
 ```
