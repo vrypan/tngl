@@ -220,16 +220,39 @@ impl FolderState {
         self.lamport = self.lamport.max(remote.version.lamport);
         self.save_lamport();
         let old = self.entries.insert(path.clone(), remote.clone());
-        let changed = std::slice::from_ref(&path);
-        update_tree_snapshot(&mut self.tree, &self.entries, changed, |_| true);
-        update_tree_snapshot(&mut self.live_tree, &self.entries, changed, |e| {
+
+        // Tombstone all live descendants so the entries map stays consistent
+        // with the filesystem after a directory deletion.
+        let mut extra_changes = Vec::new();
+        if remote.kind == EntryKind::Tombstone {
+            let prefix = format!("{path}/");
+            let children: Vec<String> = self
+                .entries
+                .keys()
+                .filter(|p| p.starts_with(&prefix))
+                .cloned()
+                .collect();
+            for child in children {
+                let child_entry = self.entries.get(&child).cloned().unwrap();
+                if child_entry.kind != EntryKind::Tombstone {
+                    let version = self.next_version();
+                    let new = tombstone_entry(&child, &child_entry, version);
+                    self.entries.insert(child.clone(), new.clone());
+                    extra_changes.push(Change { path: child, old: Some(child_entry), new });
+                }
+            }
+        }
+
+        let mut changed_paths: Vec<String> = vec![path.clone()];
+        changed_paths.extend(extra_changes.iter().map(|c| c.path.clone()));
+        update_tree_snapshot(&mut self.tree, &self.entries, &changed_paths, |_| true);
+        update_tree_snapshot(&mut self.live_tree, &self.entries, &changed_paths, |e| {
             e.kind != EntryKind::Tombstone
         });
-        Ok(Some(Change {
-            path,
-            old,
-            new: remote,
-        }))
+
+        let mut all_changes = vec![Change { path, old, new: remote }];
+        all_changes.extend(extra_changes);
+        Ok(Some(all_changes.remove(0)))
     }
 
     fn install_remote_file(&self, remote: &Entry, tmp_path: &Path) -> io::Result<()> {
