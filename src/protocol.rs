@@ -10,6 +10,8 @@ pub enum RequestMessage {
         request_id: u64,
         secret: String,
         joiner_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
     },
     GetRoot {
         request_id: u64,

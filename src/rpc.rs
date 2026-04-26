@@ -30,7 +30,7 @@ pub struct FolderRpc {
 
 #[derive(Debug, Clone)]
 pub enum RpcEvent {
-    PeerJoined { peer: PublicKey },
+    PeerJoined { peer: PublicKey, name: Option<String> },
 }
 
 impl FolderRpc {
@@ -175,12 +175,14 @@ impl RpcClient {
         peer: PublicKey,
         secret: String,
         joiner_id: PublicKey,
+        name: Option<String>,
     ) -> io::Result<(String, Vec<MemberEntry>)> {
         let request_id = next_request_id();
         let request = RequestMessage::Join {
             request_id,
             secret,
             joiner_id: joiner_id.to_string(),
+            name,
         };
         match self.round_trip(peer, request).await? {
             ResponseMessage::JoinAccepted {
@@ -376,6 +378,7 @@ async fn handle_request(
             request_id,
             secret,
             joiner_id,
+            name,
         } => {
             if joiner_id != peer.to_string() {
                 return ResponseMessage::JoinRejected {
@@ -386,9 +389,9 @@ async fn handle_request(
             match group::consume_invite(invites_path, &secret) {
                 Ok(true) => {
                     let mut group = group.write().await;
-                    match group.add_active_peer(peer) {
+                    match group.add_active_peer(peer, name.clone()) {
                         Ok(_) => {
-                            let _ = events.send(RpcEvent::PeerJoined { peer });
+                            let _ = events.send(RpcEvent::PeerJoined { peer, name });
                             ResponseMessage::JoinAccepted {
                                 request_id,
                                 topic_id: hex(*group.topic_id().as_bytes()),

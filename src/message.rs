@@ -121,6 +121,7 @@ mod tests {
             origin: "node-a".to_string(),
             members: vec![MemberEntry {
                 id: "node-a".to_string(),
+                name: Some("alice".to_string()),
                 status: crate::group::MemberStatus::Active,
                 lamport: 1,
             }],

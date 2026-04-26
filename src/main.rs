@@ -32,6 +32,9 @@ struct Cli {
     #[arg(long, value_name = "PATH", help = "Folder to monitor")]
     folder: PathBuf,
 
+    #[arg(long, value_name = "NAME", help = "Human-readable name for this node")]
+    name: Option<String>,
+
     #[arg(long, help = "Create a one-time group join ticket and exit")]
     invite: bool,
 
@@ -45,6 +48,13 @@ struct Cli {
 
     #[arg(long, value_name = "TICKET", help = "Join a group using a base62 ticket")]
     ticket: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "ID_OR_NAME",
+        help = "Remove a peer by node ID or name and exit (restart daemon to broadcast)"
+    )]
+    remove: Option<String>,
 
     #[arg(
         long,
@@ -99,6 +109,10 @@ async fn run() -> io::Result<()> {
         return create_invite(&state_dir, cli.expire_secs);
     }
 
+    if let Some(target) = cli.remove.as_deref() {
+        return remove_peer_cmd(&state_dir, target);
+    }
+
     let _lock = acquire_daemon_lock(&state_dir)?;
 
     let secret_key = load_or_create_secret_key(&state_dir.join(KEY_FILE))?;
@@ -113,11 +127,12 @@ async fn run() -> io::Result<()> {
     let peers_path = state_dir.join(PEERS_FILE);
     let invites_path = state_dir.join(INVITES_FILE);
     if let Some(ticket) = cli.ticket.as_deref() {
-        join_group(&endpoint, &peers_path, ticket).await?;
+        join_group(&endpoint, &peers_path, ticket, cli.name.clone()).await?;
     }
     let group = Arc::new(RwLock::new(GroupState::load_or_init(
         peers_path,
         endpoint.id(),
+        cli.name.clone(),
     )?));
     let topic_id = group.read().await.topic_id();
     let bootstrap = group.read().await.active_peers();
@@ -222,8 +237,11 @@ async fn run() -> io::Result<()> {
             }
             Some(event) = rpc_event_rx.recv() => {
                 match event {
-                    rpc::RpcEvent::PeerJoined { peer } => {
-                        tracing::info!("peer joined {peer}");
+                    rpc::RpcEvent::PeerJoined { peer, name } => {
+                        match name.as_deref() {
+                            Some(n) => tracing::info!("peer joined {peer} ({n})"),
+                            None    => tracing::info!("peer joined {peer}"),
+                        };
                         if let Err(err) = sender.join_peers(vec![peer]).await {
                             tracing::warn!("join new peer failed: {err}");
                         }
@@ -564,7 +582,7 @@ fn create_invite(state_dir: &Path, expire_secs: u64) -> io::Result<()> {
     let secret_key = load_or_create_secret_key(&state_dir.join(KEY_FILE))?;
     let node_id = secret_key.public();
     let peers_path = state_dir.join(PEERS_FILE);
-    let _group = GroupState::load_or_init(peers_path, node_id)?;
+    let _group = GroupState::load_or_init(peers_path, node_id, None)?;
     let secret_bytes = group::generate_secret()?;
     let secret_hex = hex(secret_bytes);
     let expires_at = group::now_ms()? + expire_secs.saturating_mul(1000);
@@ -574,11 +592,29 @@ fn create_invite(state_dir: &Path, expire_secs: u64) -> io::Result<()> {
     Ok(())
 }
 
-async fn join_group(endpoint: &Endpoint, peers_path: &Path, ticket: &str) -> io::Result<()> {
+fn remove_peer_cmd(state_dir: &Path, target: &str) -> io::Result<()> {
+    let secret_key = load_or_create_secret_key(&state_dir.join(KEY_FILE))?;
+    let node_id = secret_key.public();
+    let peers_path = state_dir.join(PEERS_FILE);
+    let mut group = GroupState::load_or_init(peers_path, node_id, None)?;
+    match group.remove_peer(target)? {
+        Some(id) => {
+            println!("removed {id}");
+            println!("restart the daemon to broadcast the removal to other peers");
+        }
+        None => {
+            eprintln!("no peer found matching {target:?}");
+            std::process::exit(1);
+        }
+    }
+    Ok(())
+}
+
+async fn join_group(endpoint: &Endpoint, peers_path: &Path, ticket: &str, name: Option<String>) -> io::Result<()> {
     let ticket = parse_join_ticket(ticket)?;
     let rpc_client = rpc::RpcClient::new(endpoint.clone());
     let (topic_id, members) = rpc_client
-        .join_group(ticket.issuer, ticket.secret, endpoint.id())
+        .join_group(ticket.issuer, ticket.secret, endpoint.id(), name)
         .await?;
     let topic_id = topic_id
         .parse()
