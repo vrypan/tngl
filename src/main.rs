@@ -92,7 +92,8 @@ async fn main() {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
-        .without_time()
+        .with_level(true)
+        .with_target(false)
         .init();
 
     if let Err(err) = run().await {
