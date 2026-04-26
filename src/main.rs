@@ -7,7 +7,7 @@ mod sync;
 mod watcher;
 
 use crate::group::GroupState;
-use crate::message::{GossipMessage, WireChange};
+use crate::message::GossipMessage;
 use crate::state::{Change, FolderState, hex};
 use clap::{Parser, Subcommand};
 use futures_lite::StreamExt;
@@ -276,7 +276,8 @@ async fn run_sync(
                     }
                 };
                 if let Some((changes, snapshot)) = update {
-                    publish_filesystem_changed(&sender, &snapshot, &local_origin, &changes).await;
+                    tracing::info!("filesystem changed paths={}", changes.len());
+                    publish_filesystem_changed(&sender, &snapshot, &local_origin).await;
                 }
             }
             event = receiver.next() => {
@@ -364,18 +365,12 @@ async fn publish_sync_state(sender: &GossipSender, state: &StateSnapshot, origin
     publish(sender, message).await;
 }
 
-async fn publish_filesystem_changed(
-    sender: &GossipSender,
-    state: &StateSnapshot,
-    origin: &str,
-    changes: &[Change],
-) {
+async fn publish_filesystem_changed(sender: &GossipSender, state: &StateSnapshot, origin: &str) {
     let message = GossipMessage::FilesystemChanged {
         origin: origin.to_string(),
         state_root: state.state_root,
         live_root: state.live_root,
         lamport: state.lamport,
-        changes: changes.iter().map(WireChange::from).collect(),
     };
     publish(sender, message).await;
 }
@@ -442,7 +437,14 @@ async fn handle_gossip_event(
                         }
                     }
                 }
-                _ => maybe_probe_remote_rpc(rpc_client, message, state, Arc::clone(&group)),
+                _ => maybe_probe_remote_rpc(
+                    rpc_client,
+                    message,
+                    state,
+                    Arc::clone(&group),
+                    sender.clone(),
+                    local_origin.to_string(),
+                ),
             }
         }
         Ok(GossipEvent::NeighborUp(endpoint_id)) => {
@@ -493,27 +495,16 @@ fn print_remote_message(message: &GossipMessage, state: &StateSnapshot) {
             state_root,
             live_root,
             lamport,
-            changes,
         } => {
             tracing::info!(
-                "peer filesystem origin={} lamport={} changes={} state_root={} live_root={} state_match={} live_match={}",
+                "peer filesystem origin={} lamport={} state_root={} live_root={} state_match={} live_match={}",
                 origin,
                 lamport,
-                changes.len(),
                 hex(*state_root),
                 hex(*live_root),
                 *state_root == state.state_root,
                 *live_root == state.live_root
             );
-            for change in changes {
-                tracing::info!(
-                    "peer change {} {} v{}:{}",
-                    change.verb,
-                    change.path,
-                    change.version_lamport,
-                    change.version_origin
-                );
-            }
         }
         GossipMessage::Peers { origin, members } => {
             tracing::info!("peer list origin={} members={}", origin, members.len());
@@ -526,6 +517,8 @@ fn maybe_probe_remote_rpc(
     message: GossipMessage,
     state: Arc<RwLock<FolderState>>,
     group: Arc<RwLock<GroupState>>,
+    sender: GossipSender,
+    local_origin: String,
 ) {
     let (origin, remote_state_root, remote_live_root) = match message {
         GossipMessage::SyncState {
@@ -562,14 +555,18 @@ fn maybe_probe_remote_rpc(
             }
             Ok(changes) => {
                 tracing::info!("sync peer={} applied {} changes", peer, changes.len());
-                let local_lamport = state.read().await.lamport();
+                let snapshot = {
+                    let state = state.read().await;
+                    StateSnapshot::from_state(&state)
+                };
                 if let Err(err) = group
                     .write()
                     .await
-                    .update_sync_lamport(&peer.to_string(), local_lamport)
+                    .update_sync_lamport(&peer.to_string(), snapshot.lamport)
                 {
                     tracing::warn!("update sync_lamport failed: {err}");
                 }
+                publish_sync_state(&sender, &snapshot, &local_origin).await;
             }
             Err(err) => {
                 tracing::warn!("sync peer={} failed: {err}", peer);
@@ -650,14 +647,10 @@ fn summarize_message(message: &GossipMessage) -> String {
             hex(*state_root)
         ),
         GossipMessage::FilesystemChanged {
-            origin,
-            lamport,
-            changes,
-            ..
-        } => format!(
-            "filesystem-changed origin={origin} lamport={lamport} changes={}",
-            changes.len()
-        ),
+            origin, lamport, ..
+        } => {
+            format!("filesystem-changed origin={origin} lamport={lamport}")
+        }
         GossipMessage::Peers { origin, members } => {
             format!("peers origin={origin} members={}", members.len())
         }

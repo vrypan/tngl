@@ -1,5 +1,4 @@
 use crate::group::MemberEntry;
-use crate::state::{Change, EntryKind};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -17,23 +16,11 @@ pub enum GossipMessage {
         state_root: [u8; 32],
         live_root: [u8; 32],
         lamport: u64,
-        changes: Vec<WireChange>,
     },
     Peers {
         origin: String,
         members: Vec<MemberEntry>,
     },
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct WireChange {
-    pub path: String,
-    pub verb: String,
-    pub entry_kind: EntryKind,
-    pub content_hash: Option<[u8; 32]>,
-    pub size: u64,
-    pub version_lamport: u64,
-    pub version_origin: String,
 }
 
 impl GossipMessage {
@@ -50,20 +37,6 @@ impl GossipMessage {
             Self::SyncState { origin, .. } => origin,
             Self::FilesystemChanged { origin, .. } => origin,
             Self::Peers { origin, .. } => origin,
-        }
-    }
-}
-
-impl From<&Change> for WireChange {
-    fn from(change: &Change) -> Self {
-        Self {
-            path: change.path.clone(),
-            verb: change.verb().to_string(),
-            entry_kind: change.new.kind,
-            content_hash: change.new.content_hash,
-            size: change.new.size,
-            version_lamport: change.new.version.lamport,
-            version_origin: change.new.version.origin.clone(),
         }
     }
 }
@@ -97,20 +70,11 @@ mod tests {
             state_root: [1; 32],
             live_root: [2; 32],
             lamport: 8,
-            changes: vec![WireChange {
-                path: "a.txt".to_string(),
-                verb: "file new".to_string(),
-                entry_kind: EntryKind::File,
-                content_hash: Some([3; 32]),
-                size: 10,
-                version_lamport: 8,
-                version_origin: "node-a".to_string(),
-            }],
         };
 
         let parsed = GossipMessage::from_bytes(&message.to_bytes()).unwrap();
         match parsed {
-            GossipMessage::FilesystemChanged { changes, .. } => assert_eq!(changes.len(), 1),
+            GossipMessage::FilesystemChanged { lamport, .. } => assert_eq!(lamport, 8),
             _ => panic!("wrong message variant"),
         }
     }
