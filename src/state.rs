@@ -100,11 +100,14 @@ pub struct TreeSnapshot {
     pub nodes: BTreeMap<String, TreeNode>,
 }
 
+pub type GcWatermark = BTreeMap<String, u64>;
+
 #[derive(Debug)]
 pub struct FolderState {
     root: PathBuf,
     origin: String,
     lamport: u64,
+    gc_watermark: GcWatermark,
     entries: BTreeMap<String, Entry>,
     tree: TreeSnapshot,
     live_tree: TreeSnapshot,
@@ -116,15 +119,20 @@ impl FolderState {
         let state_dir = root.join(STATE_DIR);
         fs::create_dir_all(&state_dir)?;
         let saved_lamport = load_saved_lamport(&state_dir);
+        let gc_watermark = load_gc_watermark(&state_dir);
         let saved_entries = load_saved_entries(&state_dir);
         let mut state = Self {
             root,
             origin,
             lamport: saved_lamport,
+            gc_watermark,
             entries: saved_entries,
             tree: TreeSnapshot::empty(),
             live_tree: TreeSnapshot::empty(),
         };
+        if state.prune_tombstones_covered_by_watermark() > 0 {
+            state.save_entries();
+        }
         state.rescan()?;
         state.save_lamport();
         Ok(state)
@@ -154,6 +162,10 @@ impl FolderState {
         self.lamport
     }
 
+    pub fn gc_watermark(&self) -> &GcWatermark {
+        &self.gc_watermark
+    }
+
     pub fn node(&self, prefix: &str) -> Option<TreeNode> {
         self.tree.nodes.get(&normalize_prefix(prefix)).cloned()
     }
@@ -173,6 +185,9 @@ impl FolderState {
     }
 
     pub fn should_accept_remote(&self, remote: &Entry) -> bool {
+        if self.is_version_gced(&remote.version) {
+            return false;
+        }
         self.entries
             .get(&remote.path)
             .map(|local| remote.version > local.version)
@@ -447,19 +462,72 @@ impl FolderState {
         }
     }
 
+    pub fn merge_gc_watermark(&mut self, incoming: &GcWatermark) -> (bool, usize) {
+        let mut changed = false;
+        for (origin, lamport) in incoming {
+            let local = self.gc_watermark.entry(origin.clone()).or_insert(0);
+            if *lamport > *local {
+                *local = *lamport;
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_gc_watermark();
+        }
+        let pruned = self.prune_tombstones_covered_by_watermark();
+        if pruned > 0 {
+            self.lamport += 1;
+            self.save_lamport();
+        }
+        (changed, pruned)
+    }
+
+    pub fn gc_tombstones_for_converged_root(&mut self) -> usize {
+        let mut watermark = GcWatermark::new();
+        for entry in self.entries.values() {
+            if entry.kind != EntryKind::Tombstone {
+                continue;
+            }
+            let lamport = watermark.entry(entry.version.origin.clone()).or_insert(0);
+            *lamport = (*lamport).max(entry.version.lamport);
+        }
+        if watermark.is_empty() {
+            return 0;
+        }
+        self.merge_gc_watermark(&watermark).1
+    }
+
     /// Remove tombstones whose version lamport is at or below `min_confirmed_lamport`,
     /// meaning all known peers have synced past that point and have the deletion.
     /// Returns the number of tombstones removed.
+    #[cfg(test)]
     pub fn gc_tombstones(&mut self, min_confirmed_lamport: u64) -> usize {
         if min_confirmed_lamport == 0 {
             return 0;
         }
+        let mut watermark = GcWatermark::new();
+        for entry in self.entries.values() {
+            if entry.kind == EntryKind::Tombstone && entry.version.lamport <= min_confirmed_lamport
+            {
+                let lamport = watermark.entry(entry.version.origin.clone()).or_insert(0);
+                *lamport = (*lamport).max(entry.version.lamport);
+            }
+        }
+        let (_, pruned) = self.merge_gc_watermark(&watermark);
+        pruned
+    }
+
+    fn is_version_gced(&self, version: &Version) -> bool {
+        self.gc_watermark
+            .get(&version.origin)
+            .is_some_and(|lamport| version.lamport <= *lamport)
+    }
+
+    fn prune_tombstones_covered_by_watermark(&mut self) -> usize {
         let to_remove: Vec<String> = self
             .entries
             .iter()
-            .filter(|(_, e)| {
-                e.kind == EntryKind::Tombstone && e.version.lamport <= min_confirmed_lamport
-            })
+            .filter(|(_, e)| e.kind == EntryKind::Tombstone && self.is_version_gced(&e.version))
             .map(|(k, _)| k.clone())
             .collect();
         let count = to_remove.len();
@@ -471,6 +539,13 @@ impl FolderState {
             self.live_tree = derive_live_tree(&self.entries);
         }
         count
+    }
+
+    fn save_gc_watermark(&self) {
+        let path = self.root.join(STATE_DIR).join("gc-watermark.bin");
+        if let Ok(bytes) = bincode::serialize(&self.gc_watermark) {
+            let _ = fs::write(path, bytes);
+        }
     }
 }
 
@@ -488,6 +563,13 @@ fn load_saved_lamport(state_dir: &Path) -> u64 {
         .and_then(|b| b.try_into().ok())
         .map(u64::from_le_bytes)
         .unwrap_or(0)
+}
+
+fn load_gc_watermark(state_dir: &Path) -> GcWatermark {
+    fs::read(state_dir.join("gc-watermark.bin"))
+        .ok()
+        .and_then(|bytes| bincode::deserialize(&bytes).ok())
+        .unwrap_or_default()
 }
 
 fn remove_path_if_exists(path: &Path) -> io::Result<()> {
@@ -1424,6 +1506,43 @@ mod tests {
         // GC with threshold at or above tombstone lamport: tombstone removed.
         assert_eq!(state3.gc_tombstones(tombstone_lamport), 1);
         assert!(state3.entry("a.txt").is_none());
+    }
+
+    #[test]
+    fn gc_watermark_survives_restart_and_rejects_stale_versions() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.txt"), "hello").unwrap();
+
+        let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+        fs::remove_file(tmp.path().join("a.txt")).unwrap();
+        state.apply_paths(vec![tmp.path().join("a.txt")]).unwrap();
+        let tombstone = state.entry("a.txt").unwrap();
+        let tombstone_version = tombstone.version.clone();
+
+        assert_eq!(state.gc_tombstones_for_converged_root(), 1);
+        state.save_entries();
+        assert!(state.entry("a.txt").is_none());
+        assert_eq!(
+            state.gc_watermark().get("node-a").copied(),
+            Some(tombstone_version.lamport)
+        );
+
+        let state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
+        assert!(state.entry("a.txt").is_none());
+        assert!(!state.should_accept_remote(&tombstone));
+
+        let stale_file = Entry {
+            path: "a.txt".to_string(),
+            kind: EntryKind::File,
+            content_hash: Some([1; 32]),
+            size: 5,
+            mode: None,
+            version: Version {
+                lamport: tombstone_version.lamport,
+                origin: tombstone_version.origin,
+            },
+        };
+        assert!(!state.should_accept_remote(&stale_file));
     }
 
     #[test]

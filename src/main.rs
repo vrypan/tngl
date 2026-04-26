@@ -8,7 +8,7 @@ mod watcher;
 
 use crate::group::GroupState;
 use crate::message::{GossipMessage, TreeHint};
-use crate::state::{Change, FolderState, hex};
+use crate::state::{Change, FolderState, GcWatermark, hex};
 use clap::{Parser, Subcommand};
 use futures_lite::StreamExt;
 use iroh::protocol::Router;
@@ -190,15 +190,10 @@ async fn run_sync(
     let topic_id = group.read().await.topic_id();
     let bootstrap = group.read().await.active_peers();
     let state = {
-        let mut s = FolderState::new(folder.clone(), local_origin.clone())?;
-        let min_lamport = group.read().await.min_sync_lamport();
-        let gc_count = s.gc_tombstones(min_lamport);
-        if gc_count > 0 {
-            tracing::info!("gc removed {gc_count} stale tombstones");
-            s.save_entries();
-        }
+        let s = FolderState::new(folder.clone(), local_origin.clone())?;
         Arc::new(RwLock::new(s))
     };
+    let root_reports = Arc::new(RwLock::new(RootReports::default()));
 
     {
         let state = state.read().await;
@@ -248,6 +243,14 @@ async fn run_sync(
         publish_sync_state(&sender, &StateSnapshot::from_state(&state), &local_origin).await;
     }
     publish_peers(&sender, Arc::clone(&group), &local_origin).await;
+    maybe_gc_tombstones(
+        Arc::clone(&state),
+        Arc::clone(&group),
+        Arc::clone(&root_reports),
+        &sender,
+        &local_origin,
+    )
+    .await;
 
     let mut announce_interval =
         tokio::time::interval(Duration::from_secs(announce_interval_secs.max(1)));
@@ -293,6 +296,7 @@ async fn run_sync(
                     rpc_client.clone(),
                     Arc::clone(&state),
                     Arc::clone(&group),
+                    Arc::clone(&root_reports),
                     &sender,
                     &local_origin,
                 ).await?;
@@ -323,13 +327,14 @@ async fn run_sync(
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct StateSnapshot {
     state_root: [u8; 32],
     live_root: [u8; 32],
     lamport: u64,
     state_nodes: usize,
     live_nodes: usize,
+    gc_watermark: GcWatermark,
 }
 
 impl StateSnapshot {
@@ -340,7 +345,39 @@ impl StateSnapshot {
             lamport: state.lamport(),
             state_nodes: state.tree().nodes.len(),
             live_nodes: state.live_tree().nodes.len(),
+            gc_watermark: state.gc_watermark().clone(),
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RootReport {
+    state_root: [u8; 32],
+    lamport: u64,
+}
+
+#[derive(Default)]
+struct RootReports {
+    reports: std::collections::BTreeMap<String, RootReport>,
+}
+
+impl RootReports {
+    fn update(&mut self, origin: String, report: RootReport) {
+        let apply = self
+            .reports
+            .get(&origin)
+            .is_none_or(|old| report.lamport >= old.lamport);
+        if apply {
+            self.reports.insert(origin, report);
+        }
+    }
+
+    fn all_active_match(&self, local_root: [u8; 32], active_peer_ids: &[String]) -> bool {
+        active_peer_ids.iter().all(|id| {
+            self.reports
+                .get(id)
+                .is_some_and(|report| report.state_root == local_root)
+        })
     }
 }
 
@@ -352,6 +389,7 @@ async fn publish_sync_state(sender: &GossipSender, state: &StateSnapshot, origin
         lamport: state.lamport,
         state_nodes: state.state_nodes,
         live_nodes: state.live_nodes,
+        gc_watermark: state.gc_watermark.clone(),
     };
     publish(sender, message).await;
 }
@@ -478,6 +516,7 @@ async fn handle_gossip_event(
     rpc_client: rpc::RpcClient,
     state: Arc<RwLock<FolderState>>,
     group: Arc<RwLock<GroupState>>,
+    root_reports: Arc<RwLock<RootReports>>,
     sender: &GossipSender,
     local_origin: &str,
 ) -> io::Result<()> {
@@ -494,11 +533,17 @@ async fn handle_gossip_event(
                 tracing::debug!("ignored gossip from non-member {}", message.origin());
                 return Ok(());
             }
+            if let Some(snapshot) =
+                merge_remote_gc_watermark(Arc::clone(&state), message_gc_watermark(&message)).await
+            {
+                publish_sync_state(sender, &snapshot, local_origin).await;
+            }
             let local = {
                 let state = state.read().await;
                 StateSnapshot::from_state(&state)
             };
             print_remote_message(&message, &local);
+            record_root_report(Arc::clone(&root_reports), &message).await;
             match &message {
                 GossipMessage::Peers { members, .. } => {
                     let update = group.write().await.merge_members(members.clone())?;
@@ -511,12 +556,21 @@ async fn handle_gossip_event(
                             tracing::warn!("this node is marked removed from the group");
                         }
                     }
+                    maybe_gc_tombstones(
+                        Arc::clone(&state),
+                        Arc::clone(&group),
+                        Arc::clone(&root_reports),
+                        sender,
+                        local_origin,
+                    )
+                    .await;
                 }
                 _ => maybe_probe_remote_rpc(
                     rpc_client,
                     message,
                     state,
                     Arc::clone(&group),
+                    root_reports,
                     sender.clone(),
                     local_origin.to_string(),
                 ),
@@ -543,6 +597,102 @@ async fn is_active_origin(group: &Arc<RwLock<GroupState>>, origin: &str) -> bool
     group.read().await.is_active_member(&peer)
 }
 
+fn message_gc_watermark(message: &GossipMessage) -> Option<&GcWatermark> {
+    match message {
+        GossipMessage::SyncState { gc_watermark, .. } => Some(gc_watermark),
+        GossipMessage::FilesystemChanged { .. } | GossipMessage::Peers { .. } => None,
+    }
+}
+
+async fn merge_remote_gc_watermark(
+    state: Arc<RwLock<FolderState>>,
+    gc_watermark: Option<&GcWatermark>,
+) -> Option<StateSnapshot> {
+    let gc_watermark = gc_watermark?;
+    if gc_watermark.is_empty() {
+        return None;
+    }
+
+    let mut state = state.write().await;
+    let (changed, pruned) = state.merge_gc_watermark(gc_watermark);
+    if changed {
+        tracing::debug!("gc watermark updated origins={}", gc_watermark.len());
+    }
+    if pruned == 0 {
+        return None;
+    }
+    tracing::info!("gc watermark pruned {pruned} tombstones");
+    state.save_entries();
+    Some(StateSnapshot::from_state(&state))
+}
+
+async fn record_root_report(root_reports: Arc<RwLock<RootReports>>, message: &GossipMessage) {
+    let Some((origin, report)) = root_report_from_message(message) else {
+        return;
+    };
+    root_reports.write().await.update(origin, report);
+}
+
+fn root_report_from_message(message: &GossipMessage) -> Option<(String, RootReport)> {
+    match message {
+        GossipMessage::SyncState {
+            origin,
+            state_root,
+            lamport,
+            ..
+        }
+        | GossipMessage::FilesystemChanged {
+            origin,
+            state_root,
+            lamport,
+            ..
+        } => Some((
+            origin.clone(),
+            RootReport {
+                state_root: *state_root,
+                lamport: *lamport,
+            },
+        )),
+        GossipMessage::Peers { .. } => None,
+    }
+}
+
+async fn maybe_gc_tombstones(
+    state: Arc<RwLock<FolderState>>,
+    group: Arc<RwLock<GroupState>>,
+    root_reports: Arc<RwLock<RootReports>>,
+    sender: &GossipSender,
+    local_origin: &str,
+) {
+    let (local_root, active_peer_ids) = {
+        let state = state.read().await;
+        let group = group.read().await;
+        (state.root_hash(), group.active_peer_ids())
+    };
+    let converged = root_reports
+        .read()
+        .await
+        .all_active_match(local_root, &active_peer_ids);
+    if !converged {
+        return;
+    }
+
+    let snapshot = {
+        let mut state = state.write().await;
+        if state.root_hash() != local_root {
+            return;
+        }
+        let pruned = state.gc_tombstones_for_converged_root();
+        if pruned == 0 {
+            return;
+        }
+        tracing::info!("gc converged root pruned {pruned} tombstones");
+        state.save_entries();
+        StateSnapshot::from_state(&state)
+    };
+    publish_sync_state(sender, &snapshot, local_origin).await;
+}
+
 fn print_remote_message(message: &GossipMessage, state: &StateSnapshot) {
     match message {
         GossipMessage::SyncState {
@@ -552,15 +702,17 @@ fn print_remote_message(message: &GossipMessage, state: &StateSnapshot) {
             lamport,
             state_nodes,
             live_nodes,
+            gc_watermark,
         } => {
             tracing::info!(
-                "peer state origin={} lamport={} state_root={} live_root={} state_nodes={} live_nodes={} state_match={} live_match={}",
+                "peer state origin={} lamport={} state_root={} live_root={} state_nodes={} live_nodes={} gc_origins={} state_match={} live_match={}",
                 origin,
                 lamport,
                 hex(*state_root),
                 hex(*live_root),
                 state_nodes,
                 live_nodes,
+                gc_watermark.len(),
                 *state_root == state.state_root,
                 *live_root == state.live_root
             );
@@ -597,6 +749,7 @@ fn maybe_probe_remote_rpc(
     message: GossipMessage,
     state: Arc<RwLock<FolderState>>,
     group: Arc<RwLock<GroupState>>,
+    root_reports: Arc<RwLock<RootReports>>,
     sender: GossipSender,
     local_origin: String,
 ) {
@@ -630,6 +783,14 @@ fn maybe_probe_remote_rpc(
             StateSnapshot::from_state(&state)
         };
         if remote_state_root == local.state_root && remote_live_root == local.live_root {
+            maybe_gc_tombstones(
+                Arc::clone(&state),
+                Arc::clone(&group),
+                Arc::clone(&root_reports),
+                &sender,
+                &local_origin,
+            )
+            .await;
             return;
         }
 
@@ -651,6 +812,14 @@ fn maybe_probe_remote_rpc(
         match result {
             Ok(changes) if changes.is_empty() => {
                 tracing::info!("sync peer={} no changes applied", peer);
+                maybe_gc_tombstones(
+                    Arc::clone(&state),
+                    Arc::clone(&group),
+                    Arc::clone(&root_reports),
+                    &sender,
+                    &local_origin,
+                )
+                .await;
             }
             Ok(changes) => {
                 tracing::info!("sync peer={} applied {} changes", peer, changes.len());
@@ -666,6 +835,14 @@ fn maybe_probe_remote_rpc(
                     tracing::warn!("update sync_lamport failed: {err}");
                 }
                 publish_sync_state(&sender, &snapshot, &local_origin).await;
+                maybe_gc_tombstones(
+                    Arc::clone(&state),
+                    Arc::clone(&group),
+                    Arc::clone(&root_reports),
+                    &sender,
+                    &local_origin,
+                )
+                .await;
             }
             Err(err) => {
                 tracing::warn!("sync peer={} failed: {err}", peer);

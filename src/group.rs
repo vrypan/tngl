@@ -22,8 +22,8 @@ pub struct MemberEntry {
     pub lamport: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Our local file-state lamport at the time of last successful sync with this peer.
-    /// Used to determine which tombstones are safe to garbage-collect.
+    /// Local sync progress retained for diagnostics and older peer files.
+    /// Tombstone GC now uses root convergence plus state GC watermarks.
     #[serde(default, skip_serializing_if = "crate::group::is_zero")]
     pub sync_lamport: u64,
 }
@@ -121,6 +121,15 @@ impl GroupState {
 
     pub fn active_peers(&self) -> Vec<PublicKey> {
         active_peers_from_members(&self.local_id, self.members.values())
+    }
+
+    pub fn active_peer_ids(&self) -> Vec<String> {
+        self.members
+            .values()
+            .filter(|entry| entry.id != self.local_id)
+            .filter(|entry| entry.status == MemberStatus::Active)
+            .map(|entry| entry.id.clone())
+            .collect()
     }
 
     pub fn is_active_member(&self, peer: &PublicKey) -> bool {
@@ -226,19 +235,6 @@ impl GroupState {
         entry.sync_lamport = lamport;
         self.persist()?;
         Ok(true)
-    }
-
-    /// Minimum sync_lamport across all active non-self peers.
-    /// Returns 0 when there are no other active peers (solo node — GC is safe).
-    pub fn min_sync_lamport(&self) -> u64 {
-        let mut min: Option<u64> = None;
-        for m in self.members.values() {
-            if m.id == self.local_id || m.status != MemberStatus::Active {
-                continue;
-            }
-            min = Some(min.map_or(m.sync_lamport, |v| v.min(m.sync_lamport)));
-        }
-        min.unwrap_or(u64::MAX)
     }
 
     fn persist(&self) -> io::Result<()> {

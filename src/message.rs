@@ -1,5 +1,5 @@
 use crate::group::MemberEntry;
-use crate::state::TreeNode;
+use crate::state::{GcWatermark, TreeNode};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -11,6 +11,8 @@ pub enum GossipMessage {
         lamport: u64,
         state_nodes: usize,
         live_nodes: usize,
+        #[serde(default)]
+        gc_watermark: GcWatermark,
     },
     FilesystemChanged {
         origin: String,
@@ -62,6 +64,7 @@ mod tests {
             lamport: 7,
             state_nodes: 3,
             live_nodes: 2,
+            gc_watermark: GcWatermark::new(),
         };
 
         let parsed = GossipMessage::from_bytes(&message.to_bytes()).unwrap();
