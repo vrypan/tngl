@@ -71,6 +71,9 @@ enum Command {
         /// Human-readable name for this node
         #[arg(long)]
         name: Option<String>,
+        /// Exit after joining instead of starting the sync daemon
+        #[arg(long)]
+        exit: bool,
     },
     /// Remove a peer by node ID or name
     Remove {
@@ -138,6 +141,7 @@ async fn run() -> io::Result<()> {
             folder,
             ticket,
             name,
+            exit,
         } => {
             fs::create_dir_all(&folder)?;
             let state_dir = folder.join(".lil");
@@ -151,6 +155,9 @@ async fn run() -> io::Result<()> {
                 .map_err(io::Error::other)?;
             let peers_path = state_dir.join(PEERS_FILE);
             join_group(&endpoint, &peers_path, &ticket, name.clone()).await?;
+            if exit {
+                return Ok(());
+            }
             run_sync(folder, name, false, 500, 10).await?;
         }
         Command::Sync {

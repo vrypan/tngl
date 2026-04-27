@@ -65,6 +65,8 @@ lil join /path/to/folder2 <ticket>
 ```
 
 `join` completes the handshake and then starts the daemon.
+Use `--exit` to join and exit instead, which is useful before starting `lil`
+from a service manager.
 
 ## Subcommands
 
@@ -72,7 +74,7 @@ lil join /path/to/folder2 <ticket>
 lil sync <folder> [--name <name>] [--poll] [--interval-ms <ms>]
                   [--announce-interval-secs <secs>]
 lil invite <folder> [--expire-secs <secs>]
-lil join <folder> <ticket> [--name <name>]
+lil join <folder> <ticket> [--name <name>] [--exit]
 lil peers <folder>
 lil remove <folder> <id-or-name>
 ```
@@ -82,6 +84,7 @@ lil remove <folder> <id-or-name>
 - `--interval-ms` sets the watcher debounce window (default 500 ms).
 - `--announce-interval-secs` sets how often `SyncState` is broadcast (default 10 s).
 - `--expire-secs` sets invite lifetime (default 3600 s).
+- `--exit` makes `join` stop after writing group state instead of starting the daemon.
 
 ## Ignore Rules
 
