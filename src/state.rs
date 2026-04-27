@@ -254,7 +254,11 @@ impl FolderState {
                     let version = self.next_version();
                     let new = tombstone_entry(&child, &child_entry, version);
                     self.entries.insert(child.clone(), new.clone());
-                    extra_changes.push(Change { path: child, old: Some(child_entry), new });
+                    extra_changes.push(Change {
+                        path: child,
+                        old: Some(child_entry),
+                        new,
+                    });
                 }
             }
         }
@@ -266,7 +270,11 @@ impl FolderState {
             e.kind != EntryKind::Tombstone
         });
 
-        let mut all_changes = vec![Change { path, old, new: remote }];
+        let mut all_changes = vec![Change {
+            path,
+            old,
+            new: remote,
+        }];
         all_changes.extend(extra_changes);
         Ok(Some(all_changes.remove(0)))
     }
@@ -315,7 +323,11 @@ impl FolderState {
             let version = self.next_version();
             let new = tombstone_entry(&path, &old, version);
             self.entries.insert(path.clone(), new.clone());
-            changes.push(Change { path, old: Some(old), new });
+            changes.push(Change {
+                path,
+                old: Some(old),
+                new,
+            });
         }
 
         self.tree = derive_tree(&self.entries);
@@ -335,7 +347,10 @@ impl FolderState {
             })
             .collect();
 
-        if canonical_paths.iter().any(|p| p == &self.root.join(IGNORE_FILE_NAME)) {
+        if canonical_paths
+            .iter()
+            .any(|p| p == &self.root.join(IGNORE_FILE_NAME))
+        {
             return self.rescan();
         }
 
@@ -422,7 +437,11 @@ impl FolderState {
         let mut new = live;
         new.version = self.next_version();
         self.entries.insert(path.to_string(), new.clone());
-        changes.push(Change { path: path.to_string(), old: existing, new });
+        changes.push(Change {
+            path: path.to_string(),
+            old: existing,
+            new,
+        });
     }
 
     fn tombstone_descendants(&mut self, relative: &str, changes: &mut Vec<Change>) {
@@ -441,7 +460,11 @@ impl FolderState {
             let version = self.next_version();
             let new = tombstone_entry(&path, &old, version);
             self.entries.insert(path.clone(), new.clone());
-            changes.push(Change { path, old: Some(old), new });
+            changes.push(Change {
+                path,
+                old: Some(old),
+                new,
+            });
         }
     }
 
@@ -1387,7 +1410,10 @@ mod tests {
         fs::write(sub.join("b.txt"), "b").unwrap();
 
         let mut state = FolderState::new(tmp.path().to_path_buf(), "node-a".to_string()).unwrap();
-        assert_eq!(state.entries.get("sub/a.txt").unwrap().kind, EntryKind::File);
+        assert_eq!(
+            state.entries.get("sub/a.txt").unwrap().kind,
+            EntryKind::File
+        );
 
         fs::remove_dir_all(&sub).unwrap();
         let changes = state.apply_paths(vec![sub]).unwrap();
@@ -1424,10 +1450,7 @@ mod tests {
 
         assert!(changes.iter().any(|c| c.path == ".nolil"));
         // keep.txt is now ignored but stays live in state — no deletion broadcast
-        assert_eq!(
-            state.entries.get("keep.txt").unwrap().kind,
-            EntryKind::File
-        );
+        assert_eq!(state.entries.get("keep.txt").unwrap().kind, EntryKind::File);
     }
 
     #[test]
@@ -1442,12 +1465,17 @@ mod tests {
         // Modify via apply_paths, then confirm rescan sees no further changes
         // (meaning incremental state is identical to a fresh scan).
         fs::write(tmp.path().join("sub/a.txt"), "modified").unwrap();
-        state.apply_paths(vec![tmp.path().join("sub/a.txt")]).unwrap();
+        state
+            .apply_paths(vec![tmp.path().join("sub/a.txt")])
+            .unwrap();
         let incremental_root = state.root_hash();
         let incremental_live = state.live_root_hash();
 
         let further_changes = state.rescan().unwrap();
-        assert!(further_changes.is_empty(), "rescan found unexpected changes after apply_paths");
+        assert!(
+            further_changes.is_empty(),
+            "rescan found unexpected changes after apply_paths"
+        );
         assert_eq!(state.root_hash(), incremental_root);
         assert_eq!(state.live_root_hash(), incremental_live);
 
@@ -1458,7 +1486,10 @@ mod tests {
         let after_delete_live = state.live_root_hash();
 
         let further_changes = state.rescan().unwrap();
-        assert!(further_changes.is_empty(), "rescan found unexpected changes after delete");
+        assert!(
+            further_changes.is_empty(),
+            "rescan found unexpected changes after delete"
+        );
         assert_eq!(state.root_hash(), after_delete_root);
         assert_eq!(state.live_root_hash(), after_delete_live);
     }

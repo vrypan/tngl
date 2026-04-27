@@ -113,7 +113,10 @@ async fn run() -> io::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Invite { folder, expire_secs } => {
+        Command::Invite {
+            folder,
+            expire_secs,
+        } => {
             fs::create_dir_all(&folder)?;
             let state_dir = folder.join(".lil");
             fs::create_dir_all(&state_dir)?;
@@ -131,7 +134,11 @@ async fn run() -> io::Result<()> {
             fs::create_dir_all(&state_dir)?;
             return peers_cmd(&state_dir);
         }
-        Command::Join { folder, ticket, name } => {
+        Command::Join {
+            folder,
+            ticket,
+            name,
+        } => {
             fs::create_dir_all(&folder)?;
             let state_dir = folder.join(".lil");
             fs::create_dir_all(&state_dir)?;
@@ -197,14 +204,7 @@ async fn run_sync(
 
     {
         let state = state.read().await;
-        print_start(
-            &state,
-            &endpoint,
-            topic_id,
-            &bootstrap,
-            poll,
-            interval_ms,
-        );
+        print_start(&state, &endpoint, topic_id, &bootstrap, poll, interval_ms);
     }
 
     let (fs_tx, mut fs_rx) = mpsc::unbounded_channel::<Vec<PathBuf>>();
@@ -782,65 +782,59 @@ fn maybe_probe_remote_rpc(
             let state = state.read().await;
             StateSnapshot::from_state(&state)
         };
-        if remote_state_root == local.state_root && remote_live_root == local.live_root {
-            maybe_gc_tombstones(
-                Arc::clone(&state),
-                Arc::clone(&group),
-                Arc::clone(&root_reports),
-                &sender,
-                &local_origin,
-            )
-            .await;
-            return;
-        }
 
-        let result = if use_advertised_root {
-            sync::reconcile_with_advertised_root(
-                rpc_client,
-                Arc::clone(&state),
-                peer,
-                remote_state_root,
-                remote_live_root,
-                remote_lamport,
-                hint,
-            )
-            .await
-        } else {
-            sync::reconcile_with_peer(rpc_client, Arc::clone(&state), peer).await
-        };
-
-        match result {
-            Ok(changes) if changes.is_empty() => {
-                tracing::info!("sync peer={} no changes applied", peer);
-                maybe_gc_tombstones(
+        let sync_result =
+            if remote_state_root == local.state_root && remote_live_root == local.live_root {
+                Ok(None)
+            } else if use_advertised_root {
+                match sync::reconcile_with_advertised_root(
+                    rpc_client,
                     Arc::clone(&state),
-                    Arc::clone(&group),
-                    Arc::clone(&root_reports),
-                    &sender,
-                    &local_origin,
+                    peer,
+                    remote_state_root,
+                    remote_live_root,
+                    remote_lamport,
+                    hint,
                 )
-                .await;
+                .await
+                {
+                    Ok(changes) => Ok(Some(changes)),
+                    Err(err) => Err(err),
+                }
+            } else {
+                match sync::reconcile_with_peer(rpc_client, Arc::clone(&state), peer).await {
+                    Ok(changes) => Ok(Some(changes)),
+                    Err(err) => Err(err),
+                }
+            };
+
+        match sync_result {
+            Ok(None) => {}
+            Ok(Some(changes)) if changes.is_empty() => {
+                tracing::info!("sync peer={} no changes applied", peer);
             }
-            Ok(changes) => {
+            Ok(Some(changes)) => {
                 tracing::info!("sync peer={} applied {} changes", peer, changes.len());
                 let snapshot = {
                     let state = state.read().await;
                     StateSnapshot::from_state(&state)
                 };
                 publish_sync_state(&sender, &snapshot, &local_origin).await;
-                maybe_gc_tombstones(
-                    Arc::clone(&state),
-                    Arc::clone(&group),
-                    Arc::clone(&root_reports),
-                    &sender,
-                    &local_origin,
-                )
-                .await;
             }
             Err(err) => {
                 tracing::warn!("sync peer={} failed: {err}", peer);
+                return;
             }
         }
+
+        maybe_gc_tombstones(
+            Arc::clone(&state),
+            Arc::clone(&group),
+            Arc::clone(&root_reports),
+            &sender,
+            &local_origin,
+        )
+        .await;
     });
 }
 
@@ -854,10 +848,7 @@ fn print_start(
 ) {
     tracing::info!("node {}", endpoint.id());
     tracing::info!("topic {}", hex(*topic_id.as_bytes()));
-    tracing::info!(
-        "invite command: lil invite {}",
-        state.root().display()
-    );
+    tracing::info!("invite command: lil invite {}", state.root().display());
     tracing::info!("known peers {}", bootstrap.len());
     tracing::info!("watching {}", state.root().display());
     if poll {
@@ -954,7 +945,11 @@ fn peers_cmd(state_dir: &Path) -> io::Result<()> {
             Some(n) => format!("{} ({})", member.id, n),
             None => member.id.clone(),
         };
-        let marker = if member.id == node_id.to_string() { " [self]" } else { "" };
+        let marker = if member.id == node_id.to_string() {
+            " [self]"
+        } else {
+            ""
+        };
         println!("{:?} {}{}", member.status, label, marker);
     }
     Ok(())
@@ -978,7 +973,12 @@ fn remove_peer_cmd(state_dir: &Path, target: &str) -> io::Result<()> {
     Ok(())
 }
 
-async fn join_group(endpoint: &Endpoint, peers_path: &Path, ticket: &str, name: Option<String>) -> io::Result<()> {
+async fn join_group(
+    endpoint: &Endpoint,
+    peers_path: &Path,
+    ticket: &str,
+    name: Option<String>,
+) -> io::Result<()> {
     let ticket = parse_join_ticket(ticket)?;
     let rpc_client = rpc::RpcClient::new(endpoint.clone());
     let (topic_id, members) = rpc_client

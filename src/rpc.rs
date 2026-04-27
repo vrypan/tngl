@@ -1,6 +1,7 @@
 use crate::group::{self, GroupState, MemberEntry};
-use crate::protocol::{RequestMessage, ResponseMessage, assert_eof, close_send, read_frame, write_frame};
-use tokio::io::AsyncWriteExt;
+use crate::protocol::{
+    RequestMessage, ResponseMessage, assert_eof, close_send, read_frame, write_frame,
+};
 use crate::state::{Entry, FolderState, TreeNode, hex};
 use iroh::endpoint::{Connection, ConnectionError};
 use iroh::protocol::{AcceptError, ProtocolHandler};
@@ -10,6 +11,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock, mpsc};
 
 pub const ALPN: &[u8] = b"lil/rpc/1";
@@ -30,7 +32,10 @@ pub struct FolderRpc {
 
 #[derive(Debug, Clone)]
 pub enum RpcEvent {
-    PeerJoined { peer: PublicKey, name: Option<String> },
+    PeerJoined {
+        peer: PublicKey,
+        name: Option<String>,
+    },
 }
 
 impl FolderRpc {
@@ -415,7 +420,9 @@ async fn handle_request(
             }
         }
         RequestMessage::GetRoot { request_id } => {
-            if let Err(e) = check_member(group, peer, request_id).await { return e; }
+            if let Err(e) = check_member(group, peer, request_id).await {
+                return e;
+            }
             let state = state.read().await;
             ResponseMessage::Root {
                 request_id,
@@ -425,7 +432,9 @@ async fn handle_request(
             }
         }
         RequestMessage::GetNode { request_id, prefix } => {
-            if let Err(e) = check_member(group, peer, request_id).await { return e; }
+            if let Err(e) = check_member(group, peer, request_id).await {
+                return e;
+            }
             let state = state.read().await;
             ResponseMessage::Node {
                 request_id,
@@ -433,7 +442,9 @@ async fn handle_request(
             }
         }
         RequestMessage::GetEntry { request_id, path } => {
-            if let Err(e) = check_member(group, peer, request_id).await { return e; }
+            if let Err(e) = check_member(group, peer, request_id).await {
+                return e;
+            }
             let state = state.read().await;
             ResponseMessage::Entry {
                 request_id,

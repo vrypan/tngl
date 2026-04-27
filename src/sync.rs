@@ -64,14 +64,7 @@ pub async fn reconcile_with_advertised_root(
     let mut changes = Vec::new();
     let mut stack = vec![("".to_string(), remote_root)];
     while let Some((prefix, remote_hash)) = stack.pop() {
-        reconcile_node(
-            &ctx,
-            &prefix,
-            remote_hash,
-            &mut changes,
-            &mut stack,
-        )
-        .await?;
+        reconcile_node(&ctx, &prefix, remote_hash, &mut changes, &mut stack).await?;
     }
 
     // Post-reconciliation sweep: for every tombstone we accepted, re-run
